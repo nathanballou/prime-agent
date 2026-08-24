@@ -147,6 +147,9 @@ export function buildSnapshotCode(
 	return `
 def _prime_agent_snapshot_state():
     import builtins as _b, datetime, hashlib, io, json, os, sys, time
+    # Two kernels can share one session directory (a restart flushing while its
+    # replacement snapshots), so staging files carry the writer's pid.
+    _tmp_suffix = ".tmp." + _b.str(os.getpid())
     try:
         import dill
     except _b.Exception:
@@ -241,7 +244,7 @@ def _prime_agent_snapshot_state():
                 if hashlib.sha256(_existing).hexdigest() != _digest or _b.len(_existing) != _b.len(_blob):
                     return None
             else:
-                _tmp_artifact = _target + ".tmp"
+                _tmp_artifact = _target + _tmp_suffix
                 with _b.open(_tmp_artifact, "wb") as _fh:
                     _fh.write(_blob)
                 os.replace(_tmp_artifact, _target)
@@ -254,7 +257,7 @@ def _prime_agent_snapshot_state():
             }
         except _b.Exception:
             try:
-                os.remove(_target + ".tmp")
+                os.remove(_target + _tmp_suffix)
             except _b.Exception:
                 pass
             return None
@@ -343,7 +346,7 @@ def _prime_agent_snapshot_state():
         return
 
     _started_ms = _b.int(_started * 1000)
-    _tmp = ${pyStr(outPath)} + ".tmp"
+    _tmp = ${pyStr(outPath)} + _tmp_suffix
     try:
         os.makedirs(os.path.dirname(${pyStr(outPath)}) or ".", exist_ok=True)
         with _b.open(_tmp, "wb") as _fh:
@@ -355,7 +358,6 @@ def _prime_agent_snapshot_state():
             return
         with _b.open(_tmp, "rb") as _fh:
             _payload_digest = hashlib.sha256(_fh.read()).hexdigest()
-        os.replace(_tmp, ${pyStr(outPath)})
     except _b.Exception:
         try:
             os.remove(_tmp)
@@ -388,19 +390,38 @@ def _prime_agent_snapshot_state():
         "pythonVersion": sys.version.split()[0],
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
-    _manifest_tmp = ${pyStr(manifestPath)} + ".tmp"
+    _manifest_tmp = ${pyStr(manifestPath)} + _tmp_suffix
     try:
         os.makedirs(os.path.dirname(${pyStr(manifestPath)}) or ".", exist_ok=True)
         with _b.open(_manifest_tmp, "w") as _fh:
             json.dump(_manifest, _fh, separators=(",", ":"))
-        os.replace(_manifest_tmp, ${pyStr(manifestPath)})
     except _b.Exception:
-        try:
-            os.remove(_manifest_tmp)
-        except _b.Exception:
-            pass
+        for _staged in (_manifest_tmp, _tmp):
+            try:
+                os.remove(_staged)
+            except _b.Exception:
+                pass
         _b.print(${pyStr(KERNEL_STATE_RESULT_MARKER)} + json.dumps({"error": "manifest write failed"}))
         return
+    # Publish both staged files. Nothing slow sits between the two renames, and a
+    # snapshot timeout arrives as KeyboardInterrupt, so finishing the critical
+    # section beats leaving a payload the manifest on disk does not describe.
+    while True:
+        try:
+            if os.path.exists(_tmp):
+                os.replace(_tmp, ${pyStr(outPath)})
+            os.replace(_manifest_tmp, ${pyStr(manifestPath)})
+            break
+        except _b.KeyboardInterrupt:
+            continue
+        except _b.Exception:
+            for _staged in (_manifest_tmp, _tmp):
+                try:
+                    os.remove(_staged)
+                except _b.Exception:
+                    pass
+            _b.print(${pyStr(KERNEL_STATE_RESULT_MARKER)} + json.dumps({"error": "checkpoint commit failed"}))
+            return
     while True:
         try:
             for _name in _pruned:
@@ -483,7 +504,7 @@ def _prime_agent_restore_state():
         "schemaVersion", "status", "savedNames", "requiredNames", "skipped", "retainedValues",
         "largestRetainedValues", "bytes", "payloadBytes", "payloadDigest", "durableBytes",
         "previousCheckpointTurn", "previousDurableBytes", "checkpointTurn",
-        "serializeStartedAtMonotonicMs", "serializeEndedAtMonotonicMs", "pythonVersion", "timestamp",
+        "serializeStartedAtMonotonicMs", "serializeEndedAtMonotonicMs", "pruned", "pythonVersion", "timestamp",
     }
     if _b.set(_manifest.keys()) != _expected_manifest_keys:
         _b.print(${pyStr(KERNEL_STATE_RESULT_MARKER)} + json.dumps({"error": "snapshot manifest unverifiable"}))
@@ -491,6 +512,7 @@ def _prime_agent_restore_state():
     _saved_names = _manifest.get("savedNames")
     _required_names = _manifest.get("requiredNames")
     _skipped = _manifest.get("skipped")
+    _pruned = _manifest.get("pruned")
     _retained_values = _manifest.get("retainedValues")
     _largest_retained_values = _manifest.get("largestRetainedValues")
     _payload_bytes_expected = _manifest.get("payloadBytes")
@@ -507,6 +529,7 @@ def _prime_agent_restore_state():
         not _b.isinstance(_saved_names, _b.list) or
         not _b.isinstance(_required_names, _b.list) or
         not _b.isinstance(_skipped, _b.list) or
+        not _b.isinstance(_pruned, _b.list) or
         not _b.isinstance(_retained_values, _b.list) or
         not _b.isinstance(_largest_retained_values, _b.list) or
         not _b.isinstance(_checkpoint_turn, _b.int) or _b.isinstance(_checkpoint_turn, _b.bool) or _checkpoint_turn < 0 or
@@ -518,9 +541,11 @@ def _prime_agent_restore_state():
         _b.len(_required_names) != _b.len(_b.set(_required_names)) or
         _b.sorted(_saved_names) != _saved_names or
         _b.sorted(_required_names) != _required_names or
+        _b.sorted(_pruned) != _pruned or
+        _b.len(_pruned) != _b.len(_b.set(_pruned)) or
         _b.any(
             not _b.isinstance(_name, _b.str) or not _name or _name.startswith("_") or _name in _always_skip or _b.len(_name) > 256
-            for _name in _saved_names + _required_names
+            for _name in _saved_names + _required_names + _pruned
         ) or
         not _b.isinstance(_payload_bytes_expected, _b.int) or _b.isinstance(_payload_bytes_expected, _b.bool) or _payload_bytes_expected < 0 or _payload_bytes_expected > _max_bytes or
         not _b.isinstance(_payload_digest_expected, _b.str) or

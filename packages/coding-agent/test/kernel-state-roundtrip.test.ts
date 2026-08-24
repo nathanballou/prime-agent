@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ensureKernelPython } from "../src/core/kernel/bootstrap.js";
 import { KernelManager } from "../src/core/kernel/index.js";
 
 function resolveKernelPython(): string | null {
@@ -18,19 +19,21 @@ function resolveKernelPython(): string | null {
 	return null;
 }
 
-const python = resolveKernelPython();
-const describeIfKernel = python ? describe : describe.skip;
+// Provisioned rather than skipped when absent: skipping made every checkpoint
+// round-trip invisible to CI, where no kernel venv exists until something builds one.
+let python: string | null = null;
 
-describeIfKernel("kernel state snapshot round-trip (real kernel)", { tags: ["kernel-heavy"] }, () => {
+describe("kernel state snapshot round-trip (real kernel)", { tags: ["kernel-heavy"] }, () => {
 	let dir = "";
 	let snapshotPath = "";
 	let manifestPath = "";
 
-	beforeAll(() => {
+	beforeAll(async () => {
+		python = resolveKernelPython() ?? (await ensureKernelPython());
 		dir = mkdtempSync(join(tmpdir(), "prime-agent-state-roundtrip-"));
 		snapshotPath = join(dir, "session.dill");
 		manifestPath = join(dir, "session.json");
-	});
+	}, 600_000);
 
 	afterAll(() => {
 		if (dir) rmSync(dir, { recursive: true, force: true });
@@ -72,6 +75,54 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", { tags: ["ker
 			expect(echo.stdout.trim()).toBe("42 84 6");
 		} finally {
 			await reader.dispose();
+		}
+	}, 60_000);
+
+	it("commits the payload and its manifest together when a snapshot is interrupted", async () => {
+		const interruptedDir = mkdtempSync(join(tmpdir(), "prime-agent-state-interrupt-"));
+		const path = join(interruptedDir, "state.dill");
+		const manifest = join(interruptedDir, "state.json");
+		const writer = new KernelManager({
+			python: python as string,
+			cwd: interruptedDir,
+			snapshot: { path, manifestPath: manifest },
+		});
+		try {
+			await writer.execute("alpha = 1");
+			expect(await writer.snapshotState()).not.toBeNull();
+			// Interrupt the commit between the payload rename and the manifest
+			// rename: the timeout path a loaded box hits, in the one window where a
+			// stale manifest would describe a payload that has already moved.
+			await writer.execute(`import os
+_replace = os.replace
+def _interrupt_once(_src, _dst, *_a, **_kw):
+    if _b_dst_is_manifest(_dst):
+        os.replace = _replace
+        raise KeyboardInterrupt
+    return _replace(_src, _dst, *_a, **_kw)
+def _b_dst_is_manifest(_dst):
+    return str(_dst).endswith(".json")
+os.replace = _interrupt_once
+alpha = 2`);
+			expect(await writer.snapshotState()).not.toBeNull();
+		} finally {
+			// kill(), not dispose(): a dispose flush would rewrite a consistent pair
+			// and hide the half-commit this test is about.
+			await writer.kill();
+		}
+
+		const reader = new KernelManager({
+			python: python as string,
+			cwd: interruptedDir,
+			snapshot: { path, manifestPath: manifest },
+		});
+		try {
+			const restore = await reader.restoreState();
+			expect(restore?.restored).toContain("alpha");
+			expect((await reader.execute("print(alpha)")).stdout.trim()).toBe("2");
+		} finally {
+			await reader.dispose().catch(() => undefined);
+			rmSync(interruptedDir, { recursive: true, force: true });
 		}
 	}, 60_000);
 
@@ -375,8 +426,10 @@ late_small = "d" * 1_000`);
 			await manager.execute('large_text = "x" * 16_384');
 			expect(await manager.pruneOversizedVariables()).toBeNull();
 			expect(await manager.listNamespaceNames()).toContain("large_text");
+			// The dispose flush hits the same unwritable path and must fail closed
+			// rather than report a checkpoint it never committed.
+			await expect(manager.dispose()).rejects.toThrow(/payload write failed/);
 		} finally {
-			await manager.dispose();
 			rmSync(failedDir, { recursive: true, force: true });
 		}
 	}, 60_000);

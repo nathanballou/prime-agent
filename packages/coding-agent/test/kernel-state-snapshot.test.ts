@@ -140,6 +140,10 @@ describe("buildSnapshotCode", () => {
 		expect(code).toContain("import dill");
 		expect(code).toContain("os.replace");
 		expect(code).toContain("except _b.KeyboardInterrupt");
+		// Staging paths are per-process so two kernels sharing a session directory
+		// cannot interleave writes into one temp file.
+		expect(code).toContain('_tmp_suffix = ".tmp." + _b.str(os.getpid())');
+		expect(code).not.toContain('+ ".tmp"');
 		expect(code).toContain('"rlm"');
 		expect(code).toContain(`print(${JSON.stringify(MARKER)}`);
 	});
@@ -152,5 +156,27 @@ describe("buildRestoreCode", () => {
 		expect(code).toContain('"/state/sess.dill"');
 		expect(code).toContain("os.path.exists");
 		expect(code).toContain("dill.loads");
+	});
+});
+
+/** Manifest keys the snapshot writer emits, read out of the generated Python literal. */
+function writerManifestKeys(code: string): string[] {
+	const body = code.slice(code.indexOf("_manifest = {"), code.indexOf("_manifest_tmp ="));
+	return [...body.matchAll(/^\s{8}"([A-Za-z]+)":/gm)].map(([, key]) => key).sort();
+}
+
+/** Manifest keys the restore path will accept, read out of its exact-match key set. */
+function readerManifestKeys(code: string): string[] {
+	const body = code.slice(code.indexOf("_expected_manifest_keys = {"), code.indexOf("if _b.set(_manifest.keys())"));
+	return [...body.matchAll(/"([A-Za-z]+)"/g)].map(([, key]) => key).sort();
+}
+
+describe("snapshot manifest contract", () => {
+	// The reader compares the manifest key set for exact equality, so a key added on
+	// one side and not the other makes every committed checkpoint unrestorable.
+	it("writes exactly the manifest keys the restore path accepts", () => {
+		expect(writerManifestKeys(buildSnapshotCode("/state/sess.dill", "/state/sess.json", 1024))).toEqual(
+			readerManifestKeys(buildRestoreCode("/state/sess.dill", "/state/sess.json")),
+		);
 	});
 });

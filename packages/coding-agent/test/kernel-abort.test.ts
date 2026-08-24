@@ -404,6 +404,9 @@ describe("KernelManager abort handling", () => {
 				captureSnapshot: (options?: { executionTimeoutMs?: number }) => Promise<unknown>;
 			}
 		).captureSnapshot({ executionTimeoutMs: 5000 });
+		// A snapshot that timed out committed nothing, so it must fail closed. The
+		// assertion is attached here, before the timer advances that trigger it.
+		const failsClosed = expect(snapshot).rejects.toThrow(/state snapshot timed out/);
 		await vi.advanceTimersByTimeAsync(5000);
 		expect(executeInner).not.toHaveBeenCalled();
 
@@ -415,6 +418,6 @@ describe("KernelManager abort handling", () => {
 		expect(signal?.aborted).toBe(false);
 		await vi.advanceTimersByTimeAsync(1);
 		expect(signal?.aborted).toBe(true);
-		await expect(snapshot).resolves.toBeNull();
+		await failsClosed;
 	});
 });

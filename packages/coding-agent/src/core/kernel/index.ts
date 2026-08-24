@@ -2989,7 +2989,7 @@ export class KernelManager {
 		const parsed = parseRestoreResult(r.stdout, cfg.path);
 		if (!parsed) {
 			throw new KernelSnapshotError(
-				"state restore failed closed: the existing checkpoint is missing, corrupt, or unverifiable",
+				`state restore failed closed: ${parseKernelStateError(r.stdout) ?? "the existing checkpoint is missing, corrupt, or unverifiable"}`,
 			);
 		}
 		if (parsed.missing) {
