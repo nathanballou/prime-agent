@@ -274,7 +274,8 @@ export type RpcResponse =
 			type: "response";
 			command: "set_heartbeat" | "update_heartbeat" | "manage_heartbeat";
 			success: true;
-			data: { heartbeat: AgentCronJob | null };
+			/** `warning` is advisory: the heartbeat was still set. */
+			data: { heartbeat: AgentCronJob | null; warning?: string };
 	  }
 
 	// Active session and subagent observation
