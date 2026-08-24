@@ -191,6 +191,23 @@ describe("default Prime autoresearch host measurement", () => {
 		expect(measurement.baselineMetricValue).toBe(0);
 	});
 
+	it("crashes with the failure recorded when the command floods stdout past the buffer cap", async () => {
+		// The host caps the command's stdout at 8MB. A runaway evaluator that prints a per-sample log
+		// reaches that, and the interesting question is whether the operator gets a legible reason or a
+		// measurement that merely looks empty. Nothing covered this, so it stays covered.
+		const script = await executableScript("yes 0123456789012345678901234567890123456789 | head -c 9000000");
+
+		const measurement = await measure(script);
+
+		expect(measurement.status).toBe("crashed");
+		expect(measurement.proxySignals).toHaveLength(1);
+		expect(measurement.proxySignals[0]).toMatch(/^workflow_metric_command_failed:/);
+		expect(measurement.proxySignals[0]).toContain("maxBuffer");
+		// A crashed measurement must not read as a real one: no metric, no fabricated sample count.
+		expect(measurement.metricValue).toBe(0);
+		expect(measurement.baselineMetricValue).toBe(0);
+	});
+
 	it("crashes with an invalid-output reason when stdout carries no measurement", async () => {
 		const script = await executableScript('echo "all good, nothing to report"');
 

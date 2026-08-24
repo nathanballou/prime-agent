@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import type { KernelManager } from "../src/core/kernel/index.js";
+import {
+	type HostRequestHandlers,
+	installHostRequestCapabilityResolver,
+	type KernelManager,
+} from "../src/core/kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 import { acpUpdatesForSessionEvent } from "../src/modes/acp/acp-events.js";
@@ -40,6 +44,22 @@ function toolEndEvent(toolCallId: string, output: string, isError = false): Agen
 		result: { output },
 		isError,
 	} as AgentConnectionSessionEvent;
+}
+
+// Several kernel host requests are "mutate" access, so the gateway requires a capability bound to a
+// current decision plus a single-use replay nonce. Raw handler literals carry none of that, which is
+// why these tests failed with "requires host capability ...". Same shape as the helper in
+// kernel-agent-message-skill.test.ts.
+function authorizedHostHandlers(handlers: HostRequestHandlers): HostRequestHandlers {
+	let nonce = 0;
+	return installHostRequestCapabilityResolver(handlers, (requestType) => ({
+		workflowId: "workflow-acp",
+		decisionId: "decision-acp",
+		decisionRevision: 1,
+		capabilities: [requestType],
+		expiresAt: Date.now() + 60_000,
+		nonce: `nonce-${++nonce}`,
+	}));
 }
 
 describe("ACP mode over a real IPython kernel", () => {
@@ -164,7 +184,7 @@ print(json.dumps({
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [AGENT_MESSAGE_SKILL],
 			env: { RLM_DEPTH: "0", RLM_MAX_DEPTH: "1" },
-			hostHandlers: {
+			hostHandlers: authorizedHostHandlers({
 				"rlm.list_subagents": async () => ({
 					subagents: [
 						{
@@ -187,7 +207,7 @@ print(json.dumps({
 						status: "completed",
 					},
 				}),
-			},
+			}),
 		});
 		const manager = await provisioner.ensure();
 
@@ -216,7 +236,7 @@ print(json.dumps({
 	}, async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [AGENT_MESSAGE_SKILL],
-			hostHandlers: {
+			hostHandlers: authorizedHostHandlers({
 				// The family roster: parent, siblings, and children of this agent.
 				"agent_message.list_agents": async () => ({
 					current: { name: "root", id: "session-alpha", depth: 0 },
@@ -231,7 +251,7 @@ print(json.dumps({
 					queuedAt: "2026-08-04T00:00:00.000Z",
 					deliveryMode: payload.mode ?? "auto",
 				}),
-			},
+			}),
 		});
 		const manager = await provisioner.ensure();
 

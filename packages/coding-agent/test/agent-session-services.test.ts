@@ -85,6 +85,37 @@ describe("createAgentSessionFromServices", () => {
 		});
 	});
 
+	it("carries the operator's configured metric command through to the workflow host", async () => {
+		// Every hop of this chain was unit-tested at its ends and nowhere as a whole, so a rename or a
+		// dropped spread between settings and the host would not have failed anything. The host runs
+		// this command to measure a candidate; if it arrives undefined the measurement silently
+		// degrades to "crashed" and no test noticed.
+		const tempDir = join(tmpdir(), `pi-session-metric-command-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		const workflowMetricCommand = { command: "./scripts/measure.sh", args: ["--fold", "3"], timeoutMs: 45_000 };
+		let received: Parameters<AgentSessionWorkflowHostFactory>[0] | undefined;
+		const workflowHostFactory: AgentSessionWorkflowHostFactory = async (input) => {
+			received = input;
+			throw new Error("metric_command_forwarding_probe");
+		};
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			settingsManager: SettingsManager.inMemory({ workflowMetricCommand }),
+			workflowHostFactory,
+			resourceLoaderOptions: { noPromptTemplates: true, noThemes: true },
+		});
+
+		await expect(
+			createAgentSessionFromServices({
+				services,
+				sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions")),
+			}),
+		).rejects.toThrow("metric_command_forwarding_probe");
+		expect(received?.primeWorkflowMetricCommand).toEqual(workflowMetricCommand);
+	});
+
 	it("holds kernel prewarm behind workflow construction setup", async () => {
 		const tempDir = join(tmpdir(), `pi-session-workflow-prewarm-gate-${Date.now()}-${Math.random()}`);
 		mkdirSync(tempDir, { recursive: true });
