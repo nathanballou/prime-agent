@@ -122,6 +122,34 @@ function pyJson(value: unknown): string {
 	return JSON.stringify(value);
 }
 
+/**
+ * Live host handles that are never part of a checkpoint. Emitted into the
+ * snapshot, restore, and listing code from one place: the restore path silently
+ * fell a name behind, and that same drift between writer and reader is what
+ * makes a committed checkpoint unrestorable.
+ */
+const ALWAYS_SKIP_NAMES: readonly string[] = [
+	"rlm",
+	"mcp",
+	"asyncio",
+	"In",
+	"Out",
+	"get_ipython",
+	"exit",
+	"quit",
+	"open",
+	"goal",
+	"agent_message",
+	"mempalace",
+	"workflow",
+	"workflow_ledger",
+	"ledger",
+	"lease",
+	"leases",
+	"worker",
+	"message_obligations",
+];
+
 /** Python that serializes the user namespace to an atomic payload and manifest. */
 export function buildSnapshotCode(
 	outPath: string,
@@ -172,7 +200,7 @@ def _prime_agent_snapshot_state():
     _transient_classifications = ${pyJson(transientClassifications)}
     _artifact_root = ${pyStr(artifactRoot)}
     _artifact_dir_name = "kernel-state-artifacts"
-    _always_skip = {"rlm", "mcp", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open", "goal", "agent_message", "mempalace", "workflow", "workflow_ledger", "ledger", "lease", "leases", "worker", "message_obligations"}
+    _always_skip = _b.set(${pyJson(ALWAYS_SKIP_NAMES)})
 
     _ip = None
     try:
@@ -524,7 +552,7 @@ def _prime_agent_restore_state():
     _checkpoint_turn = _manifest.get("checkpointTurn")
     _previous_checkpoint_turn = _manifest.get("previousCheckpointTurn")
     _previous_durable_bytes = _manifest.get("previousDurableBytes")
-    _always_skip = {"rlm", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open", "goal", "agent_message", "mempalace", "workflow", "workflow_ledger", "ledger", "lease", "leases", "worker", "message_obligations"}
+    _always_skip = _b.set(${pyJson(ALWAYS_SKIP_NAMES)})
     if (
         not _b.isinstance(_saved_names, _b.list) or
         not _b.isinstance(_required_names, _b.list) or
@@ -795,7 +823,7 @@ def _prime_agent_list_state_names():
         _ip = None
     _ns = _ip.user_ns if _ip is not None else _b.globals()
     _hidden = _b.set(_b.getattr(_ip, "user_ns_hidden", {}) or {}) if _ip is not None else _b.set()
-    _always_skip = {"rlm", "mcp", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open", "goal", "agent_message", "mempalace", "workflow", "workflow_ledger", "ledger", "lease", "leases", "worker", "message_obligations"}
+    _always_skip = _b.set(${pyJson(ALWAYS_SKIP_NAMES)})
     _names = []
     for _name in _b.list(_ns.keys()):
         if _name.startswith("_") or _name in _hidden or _name in _always_skip:
