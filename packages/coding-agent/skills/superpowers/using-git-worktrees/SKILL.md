@@ -66,6 +66,28 @@ guard fails. The coordinator keeps small edits in the current checkout; the
 host still supplies the exact integration SHA and runs the guard before those
 edits too.
 
+## Declared Input Guard
+
+A worktree contains tracked files only. Paths a task declared as inputs but the
+repository does not track — datasets, caches, local ledgers — are absent from a
+new workspace. The host runs this read-only check from the created workspace,
+once per declared path:
+
+```bash
+warn_missing_declared_inputs() {
+  local p reason
+  for p in "$@"; do
+    git ls-files --error-unmatch "$p" >/dev/null 2>&1 && continue
+    if git check-ignore -q "$p"; then reason=ignored; else reason=untracked; fi
+    echo "WARNING: declared input '$p' is $reason and absent from this workspace" >&2
+  done
+}
+```
+
+**Missing declared inputs are not fatal:** report every warning to the host and
+continue. This skill warns only. It never copies a path into a workspace and
+never grants that copy — the host decides whether the work proceeds without them.
+
 ## Step 0: Detect Existing Isolation
 
 **Before creating anything, check if you are already in an isolated workspace.**
@@ -104,6 +126,18 @@ as the integration target.
 
 **You have two mechanisms. Try them in this order.**
 
+**Repository with no commits:** a workspace pinned to an integration SHA cannot
+be created in a repository that has never committed, because no integration SHA
+can exist there. Check before either mechanism runs:
+
+```bash
+git rev-parse --verify --end-of-options HEAD >/dev/null 2>&1
+```
+
+**If that check fails:** Stop and report that the repository has no commits, so
+there is no integration SHA to branch an isolated workspace from. Do not create
+the first commit from this skill.
+
 ### 1a. Native Worktree Tools (preferred)
 
 The host has granted an isolated workspace operation. Do you already have a
@@ -112,6 +146,10 @@ way to create a worktree? It might be a tool with a name like `EnterWorktree`,
 it and skip to Step 2.
 
 Native tools handle directory placement, branch creation, and cleanup automatically. Using `git worktree add` when you have a native tool creates phantom state your harness can't see or manage. After the native tool returns, run `verify_worktree_at_integration "$INTEGRATION_SHA"` from the created workspace before Step 2.
+
+After the guard passes, run `warn_missing_declared_inputs` from the created
+workspace with the paths the task declared as inputs, and report every warning
+to the host before Step 2.
 
 Only proceed to Step 1b if you have no native worktree tool available.
 
@@ -153,9 +191,13 @@ change. Do not modify that file from this skill.
 # Determine path based on chosen location and the caller-supplied integration SHA
 path="$LOCATION/$BRANCH_NAME"
 
+# Paths the task declared as inputs; empty when the task declared none
+DECLARED_INPUTS=()
+
 git worktree add "$path" -b "$BRANCH_NAME" "$INTEGRATION_SHA"
 cd "$path"
 verify_worktree_at_integration "$INTEGRATION_SHA"
+warn_missing_declared_inputs "${DECLARED_INPUTS[@]}"
 ```
 
 **Permission failure:** Stop and report that the host must provide a worktree
@@ -201,6 +243,8 @@ Ready for the host to grant implementation of <feature-name>
 | Neither exists | Check instruction file, then default `.worktrees/` |
 | Directory not ignored | Stop; host must grant the `.gitignore` change |
 | Permission error on create | Stop; host must grant a worktree capability |
+| Repository has no commits | Stop; no integration SHA exists to branch from |
+| Declared input missing from workspace | Warn per path, continue, and let the host decide |
 | Acceptance baseline fails | Report the failure and wait for host direction |
 | No package.json/Cargo.toml | Report setup prerequisites to the host |
 
@@ -211,5 +255,6 @@ Ready for the host to grant implementation of <feature-name>
 | "I'm obviously not in a worktree — no need to check" | Run Step 0. Harness-created isolation and submodules both fool eyeballing; the detection commands settle it. |
 | "`git worktree add` is quicker than hunting for a native tool" | A native tool (e.g. `EnterWorktree`) owns placement, branching, and cleanup. Bypassing it is the #1 mistake — it creates phantom state your harness can't see or manage. |
 | "The worktree directory is surely ignored already" | Run `git check-ignore`. An unignored worktree directory commits the whole tree into the repo. |
+| "The worktree has everything the task needs" | A worktree carries tracked files only. Untracked and ignored inputs stay behind — warn on each declared path. |
 | "Any directory name works" | Explicit instructions beat an existing project-local directory, which beats the `.worktrees/` default. |
 | "The workspace is fresh — baseline acceptance can wait" | A dirty baseline makes every later failure ambiguous. Run the host public intent acceptance command now; proceeding past failures is the host's call. |
