@@ -2771,3 +2771,77 @@ it("recovers a terminal completion after a crash immediately following result pu
 	expect(launchWorker).toHaveBeenCalledTimes(1);
 	expect(fixture.events.filter((event) => event.payload.kind === "workflow_child_outcome_committed")).toHaveLength(1);
 });
+
+function independentGraph(taskIds: readonly string[]): WorkflowTaskGraph {
+	const tasks = taskIds.map((taskId) => task(taskId));
+	return {
+		graphRevision: 1,
+		tasks,
+		byId: new Map(tasks.map((stage) => [stage.taskId, stage])),
+		allowedAuthority: ["read_workspace"],
+		ownershipPaths: [],
+		generatedOutputPaths: [],
+		lockPaths: [],
+		namedContracts: [],
+		graphDigest: digestObject(tasks),
+	};
+}
+
+/** A worker that launches and never finishes, so every launch stays counted as running. */
+function pendingLauncher() {
+	return vi.fn(async (request: TestWorkerLauncherRequest) => ({
+		workerId: `worker:${request.taskId}`,
+		executionIdentity: `rlm:worker:${request.taskId}`,
+		processStartId: `host:${request.taskId}`,
+		processGroupId: `process-group:${request.taskId}`,
+		launchedAt: NOW,
+		completion: new Promise<TestLegacyWorkerCompletion>(() => undefined),
+	}));
+}
+
+// Concurrency is decided by launchReady alone: it filters the graph to tasks whose dependencies are
+// all terminal and slices that list to the approved ceiling. Both bounds are exercised here because
+// every other test in this file runs at maxWorkers 1, where neither bound can be observed.
+it("fans out to the approved ceiling when the graph has that much independent work", async () => {
+	const fixture = runtimeStoreFixture();
+	const launchWorker = pendingLauncher();
+	const authority = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: independentGraph(["alpha", "beta", "delta", "gamma"]),
+		maxWorkers: 3,
+		now: () => NOW,
+		workerLauncher: launchWorker,
+		prime: primeAdapter(),
+	});
+
+	await authority.start();
+
+	expect(launchWorker).toHaveBeenCalledTimes(3);
+});
+
+it("fans out only as wide as the dependency graph actually allows", async () => {
+	const fixture = runtimeStoreFixture();
+	const launchWorker = pendingLauncher();
+	const authority = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: threeStageGraph(),
+		maxWorkers: 3,
+		now: () => NOW,
+		workerLauncher: launchWorker,
+		prime: primeAdapter(),
+	});
+
+	await authority.start();
+
+	expect(launchWorker).toHaveBeenCalledTimes(1);
+});
