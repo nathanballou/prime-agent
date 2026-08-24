@@ -175,6 +175,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import { heartbeatPromptWarning } from "./heartbeat-prompt.js";
 import {
 	createHostRequestGateway,
 	type HostRequestCapabilityContext,
@@ -4729,7 +4730,13 @@ export class AgentSession {
 					throw new Error("rlm_heartbeat.create label must be a string when provided");
 				}
 				const deliveryMode = normalizeHeartbeatDeliveryMode(payload.delivery_mode ?? payload.deliveryMode);
+				// A heartbeat whose opening sentence only asks for status makes the agent report and halt,
+				// which looks healthy from outside. The user-facing /heartbeat has warned about this since it
+				// was written; an agent authoring its own heartbeat - the long-running case that needs the
+				// warning most - was getting none, because the check was only wired into the RPC command.
+				const instructionWarning = heartbeatPromptWarning(payload.instruction);
 				return {
+					...(instructionWarning === undefined ? {} : { warning: instructionWarning }),
 					heartbeat: rlmHeartbeatHostResponse(
 						controller.createRlmHeartbeat({
 							instruction: payload.instruction,
