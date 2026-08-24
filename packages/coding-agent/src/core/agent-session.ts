@@ -928,6 +928,7 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
 const WORKFLOW_TASK_BINDING_CUSTOM_ENTRY = "workflow_task_binding";
 const WORKFLOW_TASK_TERMINAL_CUSTOM_ENTRY = "workflow_task_terminal";
+const WORKFLOW_SCOPE_VIOLATION_CUSTOM_ENTRY = "workflow_scope_violation";
 const AGENT_MESSAGE_BATCH_MAX_ACTIONS = 32;
 const AGENT_MESSAGE_BATCH_MAX_CHARS = 32_768;
 
@@ -6862,6 +6863,14 @@ export class AgentSession {
 	 * not depend on a collaboration setting, because a run with sharing turned off is exactly the run
 	 * with no other witness.
 	 *
+	 * Advisory, not fatal, and deliberately so. Attribution here is tree-wide (see below) and a
+	 * declaration can be honestly incomplete - a task that legitimately touches a path it forgot to
+	 * declare is a false positive, and killing a multi-hour run over one is a worse outcome than the
+	 * violation it would prevent. So each violation is appended to the session journal, the same
+	 * durable host-owned channel as the task terminal record, where it outlives the process and stays
+	 * attributable to the task that caused it. Console output alone is not a consequence: nobody reads
+	 * it during an autonomous run, which is exactly when this fires.
+	 *
 	 * ponytail: attribution is tree-wide. Sibling workers share one working tree, so a violation
 	 * names what the tree shows, not provably this worker's write. Per-worker worktrees would make
 	 * it exact; until then a concurrent sibling can make this report the wrong author.
@@ -6876,7 +6885,8 @@ export class AgentSession {
 		if (owned === undefined && immutable === undefined) return;
 		const cwd = this.sessionManager.getCwd?.() ?? process.cwd();
 		const written = await touchedPaths(cwd).catch(() => []);
-		const taskId = this._workflowTaskBinding?.taskId ?? "unbound";
+		const binding = this._workflowTaskBinding;
+		const taskId = binding?.taskId ?? "unbound";
 		if (immutable !== undefined && !this._immutablePathsAudited) {
 			this._immutablePathsAudited = true;
 			await this._auditImmutablePaths(cwd, immutable);
@@ -6896,8 +6906,25 @@ export class AgentSession {
 		const report = (code: string, paths: readonly string[], declaredLabel: string, declared: readonly string[]) => {
 			const fresh = paths.filter((path) => !this._reportedScopeViolations.has(`${code}:${path}`));
 			if (fresh.length === 0) return;
-			for (const path of fresh) this._reportedScopeViolations.add(`${code}:${path}`);
 			console.warn(`${code} task=${taskId} paths=${fresh.join(",")} ${declaredLabel}=${declared.join(",")}`);
+			try {
+				this.sessionManager.appendCustomEntryWithRollback(WORKFLOW_SCOPE_VIOLATION_CUSTOM_ENTRY, {
+					schemaVersion: 1 as const,
+					kind: WORKFLOW_SCOPE_VIOLATION_CUSTOM_ENTRY,
+					code,
+					paths: fresh,
+					declared: [...declared],
+					taskId,
+					...(binding === undefined ? {} : { attemptId: binding.attemptId, workflowId: binding.workflowId }),
+					observedAt: new Date().toISOString(),
+				});
+			} catch {
+				// Leaving these paths unmarked costs a repeated console line and keeps the next check
+				// trying. Marking them on a failed append would lose the violation permanently, which is
+				// the failure this whole record exists to prevent.
+				return;
+			}
+			for (const path of fresh) this._reportedScopeViolations.add(`${code}:${path}`);
 		};
 		if (immutable !== undefined)
 			report("workflow_immutable_path_written", pathsInsideProtected(written, immutable), "immutable", immutable);

@@ -3,7 +3,14 @@ import { mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { Agent } from "@earendil-works/pi-agent-core";
+import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { AgentSession } from "../src/core/agent-session.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
+import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import {
 	pathsInsideProtected,
 	pathsOutsideOwned,
@@ -11,6 +18,7 @@ import {
 	trackedUnder,
 	worktreesWithChanges,
 } from "../src/core/workflow/agent-collaboration.js";
+import { createTestResourceLoader } from "./utilities.js";
 
 const run = promisify(execFile);
 
@@ -159,5 +167,97 @@ describe("work escaping the observed tree", () => {
 
 	it("returns nothing outside a repository rather than throwing", async () => {
 		expect(await worktreesWithChanges("/")).toEqual([]);
+	});
+});
+
+describe("durable violation record", () => {
+	async function sessionOverRepo(immutablePaths?: readonly string[]) {
+		const repo = await repoWith({});
+		const sessionDir = await mkdtemp(join(tmpdir(), "scope-sessions-"));
+		const settingsManager = SettingsManager.inMemory();
+		if (immutablePaths !== undefined) settingsManager.applyOverrides({ workflowImmutablePaths: [...immutablePaths] });
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const sessionManager = SessionManager.create(repo, sessionDir);
+		const session = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: getModel("anthropic", "claude-sonnet-4-5")!, systemPrompt: "s", tools: [] },
+			}),
+			sessionManager,
+			settingsManager,
+			cwd: repo,
+			modelRegistry: ModelRegistry.inMemory(authStorage),
+			resourceLoader: createTestResourceLoader(),
+		});
+		const check = session as unknown as { _reportScopeViolations(): Promise<void> };
+		return { repo, session, sessionManager, check };
+	}
+
+	function violations(sessionManager: SessionManager): readonly Record<string, unknown>[] {
+		return sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "workflow_scope_violation")
+			.map((entry) => (entry as { data: Record<string, unknown> }).data);
+	}
+
+	it("appends a durable entry for a write outside declared ownership", async () => {
+		const { repo, session, sessionManager, check } = await sessionOverRepo();
+		session.setOwnedPaths(["src"]);
+		await writeFile(join(repo, "gate.py"), "assert False\n");
+
+		await check._reportScopeViolations();
+
+		const recorded = violations(sessionManager);
+		expect(recorded).toHaveLength(1);
+		expect(recorded[0]!.code).toBe("workflow_task_scope_violation");
+		expect(recorded[0]!.paths).toContain("gate.py");
+		expect(recorded[0]!.declared).toEqual(["src"]);
+	});
+
+	it("appends a durable entry for a write under an immutable prefix", async () => {
+		const { repo, session, sessionManager, check } = await sessionOverRepo(["seed"]);
+		session.setOwnedPaths(["."]);
+		await writeFile(join(repo, "seed"), "weakened\n");
+
+		await check._reportScopeViolations();
+
+		const recorded = violations(sessionManager);
+		expect(recorded.map((entry) => entry.code)).toContain("workflow_immutable_path_written");
+	});
+
+	it("survives the process, which a console line does not", async () => {
+		const { repo, session, sessionManager, check } = await sessionOverRepo();
+		session.setOwnedPaths(["src"]);
+		await writeFile(join(repo, "gate.py"), "assert False\n");
+		await check._reportScopeViolations();
+
+		const file = sessionManager.getSessionFile()!;
+		const reopened = SessionManager.open(file, undefined, repo);
+		expect(violations(reopened)).toHaveLength(1);
+	});
+
+	it("appends once per path, so a per-tool-call check cannot flood the journal", async () => {
+		const { repo, session, sessionManager, check } = await sessionOverRepo();
+		session.setOwnedPaths(["src"]);
+		await writeFile(join(repo, "gate.py"), "assert False\n");
+
+		await check._reportScopeViolations();
+		await check._reportScopeViolations();
+
+		expect(violations(sessionManager)).toHaveLength(1);
+	});
+
+	it("is advisory: the violation does not terminate the task", async () => {
+		const { repo, session, sessionManager, check } = await sessionOverRepo();
+		session.setOwnedPaths(["src"]);
+		await writeFile(join(repo, "gate.py"), "assert False\n");
+
+		await expect(check._reportScopeViolations()).resolves.toBeUndefined();
+		expect(
+			sessionManager
+				.getBranch()
+				.some((entry) => entry.type === "custom" && entry.customType === "workflow_task_terminal"),
+		).toBe(false);
 	});
 });
