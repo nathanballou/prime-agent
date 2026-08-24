@@ -2003,6 +2003,7 @@ describe("daemon mode helpers", () => {
 				isBashRunning: false,
 				unfinishedActionCount: 0,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -2348,6 +2349,7 @@ describe("daemon mode helpers", () => {
 				clearQueue: vi.fn(() => ({ cleared: 0 })),
 				clearQueuedUserMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 				prompt: vi.fn(async () => {}),
 			},
 		} as never;
@@ -2418,6 +2420,7 @@ describe("daemon mode helpers", () => {
 					return pending;
 				},
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -2488,6 +2491,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: true,
 				unfinishedActionCount: 0,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 				waitForAgentMessagePromptDelivery,
 			},
 		} as never;
@@ -2537,6 +2541,7 @@ describe("daemon mode helpers", () => {
 					isStreaming: true,
 					unfinishedActionCount: 0,
 					queueAgentMessagePrompt: vi.fn(async () => true),
+					steerAgentMessage: vi.fn(() => false),
 					// Neither turn ends while both sessions block inside their own send.
 					waitForAgentMessagePromptDelivery: vi.fn(() => new Promise<void>(() => {})),
 				},
@@ -2605,6 +2610,7 @@ describe("daemon mode helpers", () => {
 				hasAcceptedPromptInFlight: true,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt: vi.fn(async () => true),
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3155,6 +3161,7 @@ describe("daemon mode helpers", () => {
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3212,6 +3219,7 @@ describe("daemon mode helpers", () => {
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3268,6 +3276,7 @@ describe("daemon mode helpers", () => {
 				unfinishedActionCount: 0,
 				prompt,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3323,6 +3332,7 @@ describe("daemon mode helpers", () => {
 				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3382,6 +3392,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: true,
 				unfinishedActionCount: 0,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 				waitForAgentMessagePromptDelivery,
 			},
 		} as never;
@@ -3445,6 +3456,7 @@ describe("daemon mode helpers", () => {
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3505,6 +3517,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: true,
 				unfinishedActionCount: 1,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3613,6 +3626,7 @@ describe("daemon mode helpers", () => {
 				prompt,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3751,6 +3765,7 @@ describe("daemon mode helpers", () => {
 				promptUntilAccepted,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
@@ -3813,6 +3828,7 @@ describe("daemon mode helpers", () => {
 				prompt,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
+				steerAgentMessage: vi.fn(() => false),
 			},
 		} as never;
 		await installFakeSessionMessageObligationBridge(daemon, targetState);
