@@ -15,6 +15,10 @@ import {
 	type DaemonOutbound,
 	type DaemonResponse,
 } from "../modes/daemon/daemon-protocol.js";
+import {
+	type CanonicalDaemonRuntimeAttestation,
+	classifyDaemonRuntimeMismatch,
+} from "../modes/daemon/daemon-runtime-identity.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -156,7 +160,22 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 	if (parsed.command === "list" || parsed.command === "attach" || parsed.command.startsWith("workflow-")) {
 		const probe = await probeDaemonVersion(parsed.socketPath);
 		if (probe.status === "stale") {
-			throw new StaleDaemonError(parsed.socketPath, probe.hello, probe);
+			// These commands only observe. Refusing them on a build-id difference locks the operator out
+			// of a running session they may need to steer, and the error's advice is `shutdown --force`,
+			// which stops every agent on the machine. A source-class mismatch means protocol and schema
+			// are identical, so the wire contract holds and observing is safe; only a wire-class
+			// mismatch can make the client misparse. Warn and continue in the first case.
+			const sourceOnly =
+				probe.reason === "runtime_mismatch" &&
+				(probe.mismatchedRuntimeFields ?? []).length > 0 &&
+				classifyDaemonRuntimeMismatch(
+					probe.mismatchedRuntimeFields as readonly (keyof CanonicalDaemonRuntimeAttestation)[],
+				) === "source";
+			if (!sourceOnly) throw new StaleDaemonError(parsed.socketPath, probe.hello, probe);
+			process.stderr.write(
+				`Note: this daemon predates the current source (${(probe.mismatchedRuntimeFields ?? []).join(", ")} differ). ` +
+					`Protocol and schema match, so ${parsed.command} is safe; restart the daemon to adopt newer code.\n`,
+			);
 		}
 	}
 
