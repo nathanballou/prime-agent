@@ -55,6 +55,8 @@ export interface ActiveSessionState {
 
 export interface ActiveSessionExtensionUiRequest {
 	resolve: (response: DaemonExtensionUIResponse) => void;
+	/** When the dialog was raised. A session waiting on one is blocked, not working. */
+	requestedAt: number;
 }
 
 interface ActiveSessionIdIndex {

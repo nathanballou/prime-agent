@@ -188,6 +188,12 @@ export interface SessionSummary {
 	scheduledWake?: SessionScheduledWake;
 	/** Latest message activity, used by the supervisor residency policy. */
 	lastActivityAt?: string;
+	/**
+	 * When the oldest unanswered dialog was raised, if any. Such a session reads as "working" on the
+	 * activity axis - it holds a live turn - but it is waiting on an answer nobody may be there to give,
+	 * and a heartbeat cannot clear it because the block is a pending request, not a turn boundary.
+	 */
+	blockedOnPromptSince?: string;
 	runtimeKind?: "top-level" | "subagent";
 	/** RLM spawn depth (0 for roots); fork edges preserve the source depth. */
 	rlmDepth?: number;
@@ -398,10 +404,15 @@ export function summaryForActiveSession(
 		}
 	}
 
+	const oldestDialog = [...activeSession.extensionUiRequests.values()].reduce<number | undefined>(
+		(oldest, request) => (oldest === undefined || request.requestedAt < oldest ? request.requestedAt : oldest),
+		undefined,
+	);
 	return {
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
+		...(oldestDialog === undefined ? {} : { blockedOnPromptSince: new Date(oldestDialog).toISOString() }),
 		isSessionActive: session.isSessionActive,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		hasRegisteredHeartbeat: hasRegisteredHeartbeat || undefined,

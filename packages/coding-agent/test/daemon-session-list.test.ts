@@ -58,6 +58,39 @@ describe("buildSessionList", () => {
 		]);
 	});
 
+	it("reports a session waiting on an unanswered dialog as blocked while it still reads as working", () => {
+		// A session holding a dialog holds a live turn, so the activity axis alone calls it "working" -
+		// which is exactly how a blocked run hides. Both assertions matter: the new field must appear AND
+		// activity must stay "working", because the point is that activity cannot tell them apart.
+		const state = makeState({ activeSessionId: "blocked", sessionFile: "/tmp/blocked.jsonl" });
+		const raisedAt = Date.parse("2026-05-01T00:03:00.000Z");
+		state.extensionUiRequests.set("dialog-1", { resolve: () => undefined, requestedAt: raisedAt });
+
+		const summary = summaryForActiveSession(state);
+
+		expect(summary.blockedOnPromptSince).toBe("2026-05-01T00:03:00.000Z");
+		expect(summary.activity).toBe("working");
+	});
+
+	it("reports the oldest unanswered dialog when several are pending", () => {
+		const state = makeState({ activeSessionId: "blocked-many", sessionFile: "/tmp/many.jsonl" });
+		state.extensionUiRequests.set("newer", {
+			resolve: () => undefined,
+			requestedAt: Date.parse("2026-05-01T00:09:00.000Z"),
+		});
+		state.extensionUiRequests.set("older", {
+			resolve: () => undefined,
+			requestedAt: Date.parse("2026-05-01T00:02:00.000Z"),
+		});
+
+		expect(summaryForActiveSession(state).blockedOnPromptSince).toBe("2026-05-01T00:02:00.000Z");
+	});
+
+	it("leaves blockedOnPromptSince unset when no dialog is pending", () => {
+		const state = makeState({ activeSessionId: "clear", sessionFile: "/tmp/clear.jsonl" });
+		expect(summaryForActiveSession(state).blockedOnPromptSince).toBeUndefined();
+	});
+
 	it("uses the stable session header time for active rows without a saved catalog entry", () => {
 		const state = makeState({ activeSessionId: "active", sessionFile: "/tmp/active.jsonl" });
 		const first = summaryForActiveSession(state);
@@ -1100,6 +1133,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 	}
 
 	return {
+		extensionUiRequests: new Map(),
 		activeSessionId: options.activeSessionId,
 		clients,
 		lastEventSequence: 0,

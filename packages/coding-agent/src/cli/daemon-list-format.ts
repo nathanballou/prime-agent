@@ -3,17 +3,23 @@ import { formatSessionDisplayId } from "../modes/daemon/daemon-session-id.js";
 import type { DaemonWorkflowStatusProjection, SessionSummary } from "../modes/daemon/daemon-session-list.js";
 
 // Display status derived from the lifecycle + activity axes.
-type ListStatus = "working" | "idle" | "archived";
+type ListStatus = "blocked" | "working" | "idle" | "archived";
 
 const LIST_STATUS_ORDER: Record<ListStatus, number> = {
-	working: 0,
-	idle: 1,
-	archived: 2,
+	blocked: 0,
+	working: 1,
+	idle: 2,
+	archived: 3,
 };
 
 function listStatusForSummary(summary: SessionSummary): ListStatus {
 	if (summary.lifecycle === "archived") {
 		return "archived";
+	}
+	// Sorts first because it is the one status that needs a human. On the activity axis alone a session
+	// waiting on a dialog is indistinguishable from real work, which is exactly how it hides.
+	if (summary.blockedOnPromptSince !== undefined) {
+		return "blocked";
 	}
 	return summary.activity === "working" ? "working" : "idle";
 }
@@ -71,6 +77,8 @@ function formatListCell(row: ListRow, column: keyof ListRow, value: string): str
 	}
 
 	switch (row.status) {
+		case "blocked":
+			return chalk.yellow(value);
 		case "working":
 			return chalk.red(value);
 		case "idle":

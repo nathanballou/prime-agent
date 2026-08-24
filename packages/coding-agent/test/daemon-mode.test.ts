@@ -177,8 +177,8 @@ describe("daemon mode helpers", () => {
 			...makeState("active"),
 			clients: new Set<DaemonSocketClient>([firstClient, secondClient]),
 			extensionUiRequests: new Map([
-				["request-1", { resolve: firstResolve }],
-				["request-2", { resolve: secondResolve }],
+				["request-1", { resolve: firstResolve, requestedAt: Date.now() }],
+				["request-2", { resolve: secondResolve, requestedAt: Date.now() }],
 			]),
 		};
 
@@ -296,7 +296,7 @@ describe("daemon mode helpers", () => {
 		const resolve = vi.fn();
 		const state = {
 			...makeState("active"),
-			extensionUiRequests: new Map([["request-1", { resolve }]]),
+			extensionUiRequests: new Map([["request-1", { resolve, requestedAt: Date.now() }]]),
 		};
 
 		cancelPendingExtensionUiRequests(state);
