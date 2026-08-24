@@ -195,7 +195,7 @@ const EXPECTED_FORK_SHA256: Record<string, string> = {
 	"skills/test-driven-development/SKILL.md": "8d1509519bdfdaeb824309e957039ecd71c3f0cadc4ab6dee3982b945dcdbce5",
 	"skills/test-driven-development/writing-good-tests.md":
 		"26ede517a143446803f3741440f5dd32e95225f9bbea2baad06bfa1b08e21bc1",
-	"skills/using-git-worktrees/SKILL.md": "a15f0e8b11efecd4dda8b63a913a9e2ae02e7e970a4b8ce0a8e022b147f07beb",
+	"skills/using-git-worktrees/SKILL.md": "9daae2c8d99f075062ede70ca4690de6c15268f46a0640f79b9211271e0cf15f",
 	"skills/using-superpowers/SKILL.md": "57e74ad4cab995d83da99e2bf831a0f4b9443c76b37ad351035f84fe7650db1f",
 	"skills/using-superpowers/references/antigravity-tools.md":
 		"33fabbcd18ec25710eac14b7da8a9045eeb965542697326de2a67e79f22f6c6c",
