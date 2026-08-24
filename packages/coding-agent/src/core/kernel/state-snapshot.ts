@@ -438,7 +438,8 @@ def _prime_agent_snapshot_state():
         try:
             if os.path.exists(_tmp):
                 os.replace(_tmp, ${pyStr(outPath)})
-            os.replace(_manifest_tmp, ${pyStr(manifestPath)})
+            if os.path.exists(_manifest_tmp):
+                os.replace(_manifest_tmp, ${pyStr(manifestPath)})
             break
         except _b.KeyboardInterrupt:
             continue

@@ -105,6 +105,20 @@ def _b_dst_is_manifest(_dst):
 os.replace = _interrupt_once
 alpha = 2`);
 			expect(await writer.snapshotState()).not.toBeNull();
+			// Same window, other edge: the interrupt lands after the manifest rename
+			// already published. Retrying must recognise a finished commit rather
+			// than report a checkpoint that is on disk as failed.
+			await writer.execute(`import os
+_replace = os.replace
+def _interrupt_after_manifest(_src, _dst, *_a, **_kw):
+    _result = _replace(_src, _dst, *_a, **_kw)
+    if str(_dst).endswith(".json"):
+        os.replace = _replace
+        raise KeyboardInterrupt
+    return _result
+os.replace = _interrupt_after_manifest
+alpha = 3`);
+			expect(await writer.snapshotState()).not.toBeNull();
 		} finally {
 			// kill(), not dispose(): a dispose flush would rewrite a consistent pair
 			// and hide the half-commit this test is about.
@@ -119,7 +133,7 @@ alpha = 2`);
 		try {
 			const restore = await reader.restoreState();
 			expect(restore?.restored).toContain("alpha");
-			expect((await reader.execute("print(alpha)")).stdout.trim()).toBe("2");
+			expect((await reader.execute("print(alpha)")).stdout.trim()).toBe("3");
 		} finally {
 			await reader.dispose().catch(() => undefined);
 			rmSync(interruptedDir, { recursive: true, force: true });
