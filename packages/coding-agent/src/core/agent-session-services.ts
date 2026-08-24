@@ -202,6 +202,12 @@ export interface AgentSessionWorkflowHostFactoryInput {
 	primeWorkflowResourceLoader?: WorkflowResourceLoaderPort;
 	/** Roots a workflow task may own paths under; absent keeps the built-in default. */
 	primeWorkflowWorkspacePaths?: readonly string[];
+	/** Metric command the host runs to measure a candidate. */
+	primeWorkflowMetricCommand?: {
+		readonly command: string;
+		readonly args: readonly string[];
+		readonly timeoutMs: number;
+	};
 	approvalSecretDelivery?: (input: {
 		readonly request: WorkflowApprovalRequest;
 		readonly proof: DurableApprovalSecretProof;
@@ -730,6 +736,7 @@ export async function createAgentSessionFromServices(
 								workerModelCapabilityAvailability: options.services.workerModelCapabilityAvailability,
 								primeWorkflowResourceLoader: options.services.resourceLoader,
 								primeWorkflowWorkspacePaths: options.services.settingsManager.getWorkflowWorkspacePaths(),
+								primeWorkflowMetricCommand: options.services.settingsManager.getWorkflowMetricCommand(),
 								approvalSecretDelivery,
 								executionEvidenceSourceDelivery,
 								beforeTaskLaunch,
@@ -753,6 +760,7 @@ export async function createAgentSessionFromServices(
 								workerModelCapabilityAvailability: options.services.workerModelCapabilityAvailability,
 								primeWorkflowResourceLoader: options.services.resourceLoader,
 								primeWorkflowWorkspacePaths: options.services.settingsManager.getWorkflowWorkspacePaths(),
+								primeWorkflowMetricCommand: options.services.settingsManager.getWorkflowMetricCommand(),
 								approvalSecretDelivery,
 								executionEvidenceSourceDelivery,
 								beforeTaskLaunch,

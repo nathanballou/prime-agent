@@ -1,7 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { execFile } from "node:child_process";
 import { mkdir, readdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { getBundledSkillsDir } from "../../config.js";
+import { type MetricCommandMeasurement, parseMetricCommandOutput } from "../autoresearch/metric-command.js";
 import {
 	type AutoResearchDurableRecipe,
 	type AutoResearchProductionRunner,
@@ -560,6 +563,8 @@ export interface DefaultPrimeWorkflowProviderInput {
 	/** Optional caller loader is ignored for built-in admission; canonical vendored resources are host-owned. */
 	/** Roots a task may own paths under; absent keeps DEFAULT_WORKSPACE_PATHS. */
 	readonly workspacePaths?: readonly string[];
+	/** Command the host runs to measure a candidate; absent keeps the measurement refusing. */
+	readonly metricCommand?: { readonly command: string; readonly args: readonly string[]; readonly timeoutMs: number };
 	readonly resourceLoader?: WorkflowResourceLoaderPort;
 	readonly readStatus: () => WorkflowShellStatus;
 	readonly executionEvidence: WorkflowExecutionEvidenceRuntime;
@@ -659,6 +664,8 @@ function orderedTaskGraphSourceTaskIds(source: WorkflowTaskGraphSource): readonl
  * input: The one persisted runtime, receipt authority, descriptor root, and canonical ResourceLoader.
  * Return: A lazy provider which waits for a durable workflow head before issuing immutable admissions.
  */
+const execFileAsync = promisify(execFile);
+
 export function createDefaultPrimeWorkflowProvider(
 	input: DefaultPrimeWorkflowProviderInput,
 ): DefaultPrimeWorkflowProvider {
@@ -2092,6 +2099,36 @@ async function createDefaultAutoResearchRunner(
 				)
 					throw new Error("default_prime_autoresearch_result_invalid");
 			}
+			// Measure by running the operator's configured command, in the workspace, and reading its
+			// stdout. The host has to produce the number: one reported by the worker being judged is a
+			// claim, not evidence. Every failure below stays "crashed" with the reason recorded, because
+			// the engine refuses to promote a crashed observation - so a candidate can never be accepted
+			// on the strength of a measurement that did not happen.
+			const metricCommand = input.metricCommand;
+			let measured: MetricCommandMeasurement | undefined;
+			let measuredLatencyMs = 0;
+			let measurementRejection = "workflow_metric_command_unconfigured";
+			if (metricCommand !== undefined) {
+				const startedAt = Date.now();
+				const executed = await execFileAsync(metricCommand.command, [...metricCommand.args], {
+					// The provider runs in the session process, whose cwd is the repository root — the same
+					// root the scope and immutable-path checks ask git about.
+					cwd: process.cwd(),
+					timeout: metricCommand.timeoutMs,
+					maxBuffer: 8 * 1024 * 1024,
+				}).then(
+					(result) => ({ stdout: result.stdout }),
+					(error: unknown) => ({ failure: error instanceof Error ? error.message : String(error) }),
+				);
+				measuredLatencyMs = Date.now() - startedAt;
+				if ("failure" in executed) {
+					measurementRejection = `workflow_metric_command_failed:${executed.failure}`;
+				} else {
+					const parsed = parseMetricCommandOutput(executed.stdout);
+					if ("error" in parsed) measurementRejection = `workflow_metric_command_invalid:${parsed.error}`;
+					else measured = parsed;
+				}
+			}
 			// This host executes nothing: `effect-broker.ts` implements command execution but nothing in
 			// production constructs it, and the registration commits to its evaluator by bare digest with
 			// no retrievable command text. So there is no measurement to report. Reporting one anyway -
@@ -2107,17 +2144,17 @@ async function createDefaultAutoResearchRunner(
 				source: "host" as const,
 				rawResultRefsDigest: digestObject(observation.rawResultRefs),
 				phase: "promotion" as const,
-				status: "crashed" as const,
+				status: measured === undefined ? ("crashed" as const) : ("complete" as const),
 				commandInputBinding: recipe.registration.commandInputBinding,
 				metricDirection: recipe.registration.metric.direction,
 				metricTarget: recipe.registration.metric.target,
 				metricTolerance: recipe.registration.metric.tolerance,
 				// The engine requires a positive sample count; the refusal is carried by `status`, not by
 				// pretending zero samples were taken.
-				sampleCount: observation.rawResultRefs.length,
-				metricValue: 0,
-				baselineMetricValue: 0,
-				variance: 0,
+				sampleCount: measured?.sampleCount ?? observation.rawResultRefs.length,
+				metricValue: measured?.metricValue ?? 0,
+				baselineMetricValue: measured?.baselineMetricValue ?? 0,
+				variance: measured?.variance ?? 0,
 				fixtureManifestDigest: recipe.registration.fixtures
 					.filter((fixture) => fixture.partition === "train" || fixture.partition === "eval")
 					.map((fixture) => fixture.manifestDigest)
@@ -2132,9 +2169,9 @@ async function createDefaultAutoResearchRunner(
 				parserDigest: recipe.registration.evaluator.parserDigest,
 				guardDigest: recipe.registration.guard?.guardDigest ?? null,
 				seedDigest: recipe.registration.seed.seedDigest,
-				proxySignals: [],
+				proxySignals: measured === undefined ? [measurementRejection] : [],
 				costMicrounits: 0,
-				latencyMilliseconds: 0,
+				latencyMilliseconds: measuredLatencyMs,
 				resourceUsage: defaultPrimeAutoResearchResourceVector(1),
 				hiddenMetricValue: 0,
 				adversarialMetricValue: 0,
