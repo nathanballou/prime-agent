@@ -4,6 +4,8 @@ export interface MetricCommandMeasurement {
 	readonly baselineMetricValue: number;
 	readonly sampleCount: number;
 	readonly variance: number;
+	/** Cost the evaluation actually incurred, when the command reports it. */
+	readonly costMicrounits: number;
 }
 
 /** Why a metric command's output could not be used. Never silently coerced to a number. */
@@ -49,5 +51,17 @@ export function parseMetricCommandOutput(stdout: string): MetricCommandMeasureme
 		return { error: "sampleCount must be a positive integer" };
 	const variance = finite("variance");
 	if (variance === undefined || variance < 0) return { error: "variance must be a non-negative finite number" };
-	return { metricValue, baselineMetricValue, sampleCount: sampleCount as number, variance };
+	// Optional, and 0 when unreported. A downstream cost ceiling compares against this, so a command
+	// that stays silent about cost is treated as free - which is a claim, not a measurement. Reporting
+	// it is how an operator makes that ceiling mean anything.
+	const reportedCost = record.costMicrounits;
+	if (reportedCost !== undefined && (!Number.isSafeInteger(reportedCost) || (reportedCost as number) < 0))
+		return { error: "costMicrounits must be a non-negative integer when present" };
+	return {
+		metricValue,
+		baselineMetricValue,
+		sampleCount: sampleCount as number,
+		variance,
+		costMicrounits: (reportedCost as number | undefined) ?? 0,
+	};
 }

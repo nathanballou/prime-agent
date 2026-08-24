@@ -843,7 +843,7 @@ async function composeDefaultPrimeWorkflow(
 	const autoResearchRecipe =
 		persistedAutoResearchRecipe ?? (await createDefaultAutoResearchRecipe(input, snapshots, replay, decisionRef));
 	if (persistedAutoResearchRecipe === undefined) await persistAutoResearchRecipe(input, autoResearchRecipe);
-	const autoResearchRunner = await createDefaultAutoResearchRunner(input, autoResearchRecipe);
+	const autoResearchRunner = (await createDefaultAutoResearchParts(input, autoResearchRecipe)).runner;
 	const consumeRecipeAdmission = await createDefaultRecipeAdmissionConsumer(input, snapshots.recipe);
 	const runId = `prime:${input.workflowId}:${replay.head.eventDigest}`;
 	const executionKey = digestObject({
@@ -1592,10 +1592,28 @@ async function createDefaultAutoResearchRecipe(
 	};
 }
 
-async function createDefaultAutoResearchRunner(
+/** The AutoResearch host ports and the production runner composed over them. */
+export interface DefaultAutoResearchParts {
+	readonly host: AutoResearchHostPorts;
+	readonly runner: AutoResearchProductionRunner;
+}
+
+/**
+ * Compose the host-owned AutoResearch loop for this workflow.
+ *
+ * The host is returned next to the runner because `measureObservation` is where the operator's metric
+ * command actually runs, and the runner exposes `run` only - so holding the host is the only way to
+ * prove the measurement executes a command rather than reporting a constant.
+ *
+ * Args:
+ * input: Provider input carrying the runtime store, artifact resolver, status reader, and metric command.
+ * recipe: The durable recipe whose registration every measurement is bound to.
+ * Return: The host ports and the runner built over them.
+ */
+export async function createDefaultAutoResearchParts(
 	input: DefaultPrimeWorkflowProviderInput,
 	recipe: AutoResearchDurableRecipe,
-): Promise<AutoResearchProductionRunner> {
+): Promise<DefaultAutoResearchParts> {
 	const runtime = createAutoResearchWorkflowRuntimeAdapter({
 		runtimeStore: input.runtimeStore,
 		artifactResolver: input.artifactResolver,
@@ -2129,11 +2147,11 @@ async function createDefaultAutoResearchRunner(
 					else measured = parsed;
 				}
 			}
-			// This host executes nothing: `effect-broker.ts` implements command execution but nothing in
-			// production constructs it, and the registration commits to its evaluator by bare digest with
-			// no retrievable command text. So there is no measurement to report. Reporting one anyway -
-			// metricValue 0 against baseline 1, cost and latency derived from artifact byte length - is
-			// what this did before, and a constant that reads as evidence is worse than an absence.
+			// Before the operator's metric command existed, this host executed nothing and reported
+			// metricValue 0 against baseline 1 with cost and latency derived from artifact byte length.
+			// A constant that reads as evidence is worse than an absence, so it reported absence instead.
+			// The measurement above is now real when a command is configured and succeeds; what follows
+			// is the absence path, which still matters because most failures land in it.
 			//
 			// "crashed" is that absence, stated in the engine's own vocabulary: it refuses to reuse a
 			// crashed observation for promotion, so a candidate cannot be accepted on the strength of a
@@ -2170,7 +2188,7 @@ async function createDefaultAutoResearchRunner(
 				guardDigest: recipe.registration.guard?.guardDigest ?? null,
 				seedDigest: recipe.registration.seed.seedDigest,
 				proxySignals: measured === undefined ? [measurementRejection] : [],
-				costMicrounits: 0,
+				costMicrounits: measured?.costMicrounits ?? 0,
 				latencyMilliseconds: measuredLatencyMs,
 				resourceUsage: defaultPrimeAutoResearchResourceVector(1),
 				hiddenMetricValue: 0,
@@ -2185,7 +2203,7 @@ async function createDefaultAutoResearchRunner(
 		},
 		runtime,
 	};
-	return createAutoResearchProductionRunner({
+	const runner = createAutoResearchProductionRunner({
 		host,
 		authority: {
 			runtimeStore: input.runtimeStore,
@@ -2231,6 +2249,7 @@ async function createDefaultAutoResearchRunner(
 			return { rawResultRefs: [resultRef] };
 		},
 	});
+	return { host, runner };
 }
 
 function recipeSignedReceiptPreimageDigest(receipt: WorkflowVerifiedHostReceipt): string {

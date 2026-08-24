@@ -11,13 +11,13 @@ describe("metric command output", () => {
 	it("accepts the documented shape", () => {
 		expect(
 			parseMetricCommandOutput('{"metricValue":0.31,"baselineMetricValue":0.12,"sampleCount":157,"variance":0.004}'),
-		).toEqual({ metricValue: 0.31, baselineMetricValue: 0.12, sampleCount: 157, variance: 0.004 });
+		).toEqual({ metricValue: 0.31, baselineMetricValue: 0.12, sampleCount: 157, variance: 0.004, costMicrounits: 0 });
 	});
 
 	it("accepts a negative metric, because a candidate may be worse than its baseline", () => {
 		expect(
 			parseMetricCommandOutput('{"metricValue":-0.3,"baselineMetricValue":0,"sampleCount":157,"variance":0}'),
-		).toEqual({ metricValue: -0.3, baselineMetricValue: 0, sampleCount: 157, variance: 0 });
+		).toEqual({ metricValue: -0.3, baselineMetricValue: 0, sampleCount: 157, variance: 0, costMicrounits: 0 });
 	});
 
 	it("refuses a non-finite metric rather than promoting NaN", () => {
@@ -46,11 +46,33 @@ describe("metric command output", () => {
 		expect(parseMetricCommandOutput("")).toEqual({ error: "stdout is not canonical JSON" });
 	});
 
+	it("reads a reported cost, so a downstream cost ceiling means something", () => {
+		expect(
+			parseMetricCommandOutput(
+				'{"metricValue":1,"baselineMetricValue":0,"sampleCount":2,"variance":0,"costMicrounits":4200}',
+			),
+		).toMatchObject({ costMicrounits: 4200 });
+	});
+
+	it("treats an unreported cost as zero, which is a claim the operator opts into", () => {
+		expect(
+			parseMetricCommandOutput('{"metricValue":1,"baselineMetricValue":0,"sampleCount":2,"variance":0}'),
+		).toMatchObject({ costMicrounits: 0 });
+	});
+
+	it("refuses a negative or fractional cost rather than rounding it", () => {
+		expect(
+			parseMetricCommandOutput(
+				'{"metricValue":1,"baselineMetricValue":0,"sampleCount":2,"variance":0,"costMicrounits":-1}',
+			),
+		).toEqual({ error: "costMicrounits must be a non-negative integer when present" });
+	});
+
 	it("tolerates log lines before the measurement, because real tools print progress", () => {
 		expect(
 			parseMetricCommandOutput(
 				'loading parquet\nweeks=157\n{"metricValue":0.5,"baselineMetricValue":0.5,"sampleCount":2,"variance":0}\n',
 			),
-		).toEqual({ metricValue: 0.5, baselineMetricValue: 0.5, sampleCount: 2, variance: 0 });
+		).toEqual({ metricValue: 0.5, baselineMetricValue: 0.5, sampleCount: 2, variance: 0, costMicrounits: 0 });
 	});
 });
