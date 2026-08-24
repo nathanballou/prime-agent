@@ -168,6 +168,7 @@ function createExtensionUIContext(
 			const onAbort = () => finish(fallback);
 			state.extensionUiRequests.set(requestId, {
 				resolve: (response) => finish(resolveResponse(response)),
+				requestedAt: Date.now(),
 			});
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts?.timeout !== undefined) {
