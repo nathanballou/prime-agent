@@ -174,6 +174,17 @@ async function readWorkflowAdaptiveState(session: object): Promise<{
 	}>;
 }
 
+async function readWorkflowLearningTriggers(
+	session: object,
+): Promise<readonly { readonly kind: string; readonly candidateId: string | null }[]> {
+	const readState = Reflect.get(session, "getWorkflowLearningState");
+	expect(typeof readState).toBe("function");
+	const state = (await Reflect.apply(readState as (...args: never[]) => Promise<unknown>, session, [])) as {
+		readonly triggers: readonly { readonly kind: string; readonly candidateId: string | null }[];
+	};
+	return state.triggers;
+}
+
 async function readWorkflowExecutionEvidenceState(session: object): Promise<{
 	readonly observationCount: number;
 	readonly latestObservationDigest: string | null;
@@ -490,6 +501,13 @@ it("binds the default production Prime provider through AgentSession workflow st
 			completedStageIds: ["recon"],
 			readyStageIds: ["lens"],
 		});
+		// Committing a stage produces an adaptive efficiency review. The runtime has always computed those
+		// and dropped them, so assert the review reached learning: without that, the wiring is free to
+		// regress to a no-op and every other assertion here still passes.
+		expect(adaptiveState.reviewCount).toBeGreaterThan(0);
+		expect(await readWorkflowLearningTriggers(created.session)).toContainEqual(
+			expect.objectContaining({ kind: "efficiency_review", candidateId: null }),
+		);
 		expect(adaptiveState).toMatchObject({
 			graphDigest: taskGraphDigest,
 			completedStageIds: ["recon"],

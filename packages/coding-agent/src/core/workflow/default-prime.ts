@@ -27,7 +27,12 @@ import type {
 } from "../autoresearch/types.js";
 import type { Skill } from "../skills.js";
 import { loadSkillsFromDir } from "../skills.js";
-import { createPrimeAdaptiveRuntime, type PrimeAdaptiveRuntimeHostAuthority } from "./adaptive-runtime.js";
+import {
+	createPrimeAdaptiveRuntime,
+	type PrimeAdaptiveRuntime,
+	type PrimeAdaptiveRuntimeHostAuthority,
+	type PrimeAdaptiveRuntimeState,
+} from "./adaptive-runtime.js";
 import {
 	assertWorkflowTaskGraphSourceContract,
 	readWorkflowTaskGraphSource,
@@ -1037,6 +1042,57 @@ async function composeDefaultPrimeWorkflow(
 					}),
 	});
 	await adaptiveRuntime.recover(defaultLearning.pipeline.current());
+	/**
+	 * Total reviews this state has produced, by either route.
+	 *
+	 * A pipeline transition bumps reviewCount and a scheduled window bumps periodicReviewCount; they are
+	 * separate counters for the same artifact kind. Watching only the first silently drops every
+	 * scheduled review, which is the failure this wiring exists to end.
+	 *
+	 * Args:
+	 * state: Adaptive runtime state to total.
+	 * Return: Combined count of reviews produced.
+	 */
+	const totalReviews = (state: PrimeAdaptiveRuntimeState): number => state.reviewCount + state.periodicReviewCount;
+	/**
+	 * Feed a review that actually happened into learning.
+	 *
+	 * Guarded on the total moving rather than on the ref being present: a review that was not due
+	 * returns the prior state, ref and all, and re-recording that would manufacture an experience per
+	 * commit. Recovery deliberately does not go through here — replaying a run must not re-learn from it.
+	 *
+	 * Failures are swallowed by design. A review is advisory and holds no authority, while the callers
+	 * are a durable stage commit and the session host's periodic sweep. Learning also bounds its trigger
+	 * history, and at a five-minute cadence a long run reaches that bound; letting the resulting throw
+	 * escape would fail the stage commit that happened to be next. An unrecorded review costs a
+	 * suggestion, so it must never be able to break the run it is commenting on.
+	 *
+	 * Args:
+	 * reviewsBefore: Combined review count observed before the call that may have produced one.
+	 * state: State the adaptive runtime returned.
+	 * Return: That same state, so callers can wrap in place.
+	 */
+	const recordReviewIfNew = async (
+		reviewsBefore: number,
+		state: PrimeAdaptiveRuntimeState,
+	): Promise<PrimeAdaptiveRuntimeState> => {
+		if (totalReviews(state) > reviewsBefore && state.latestReviewRef !== null)
+			await defaultLearning.recordEfficiencyReview(state.latestReviewRef).catch(() => undefined);
+		return state;
+	};
+	// Wrapping here rather than at the call sites because reviews arrive by two routes - a pipeline
+	// commit and the periodic sweep the session host drives - and the session host reads this same
+	// object off the exposed parts. One wrapper covers both without plumbing learning across modules.
+	const learningAdaptiveRuntime: PrimeAdaptiveRuntime = Object.freeze({
+		...adaptiveRuntime,
+		onPipelineCommitted: async (committed: PrimeWorkflowPipelineState) =>
+			recordReviewIfNew(
+				totalReviews(adaptiveRuntime.current()),
+				await adaptiveRuntime.onPipelineCommitted(committed),
+			),
+		reviewIfDue: async () =>
+			recordReviewIfNew(totalReviews(adaptiveRuntime.current()), await adaptiveRuntime.reviewIfDue()),
+	});
 	const pipeline: PrimeWorkflowPipelineRuntime = Object.freeze({
 		current: () => defaultLearning.pipeline.current(),
 		read: () => defaultLearning.pipeline.read(),
@@ -1044,7 +1100,7 @@ async function composeDefaultPrimeWorkflow(
 			const classification = await taskRuntime.prime.recordEvidence(request);
 			await taskRuntime.assertStageAcceptable({ stageId: request.stageId, classification });
 			const state = await defaultLearning.pipeline.record(request);
-			await adaptiveRuntime.onPipelineCommitted(state);
+			await learningAdaptiveRuntime.onPipelineCommitted(state);
 			await taskRuntime.acceptStage({ stageId: request.stageId, classification });
 			return state;
 		},
@@ -1241,7 +1297,7 @@ async function composeDefaultPrimeWorkflow(
 		},
 		completionRequestHandler,
 		pipeline,
-		adaptiveRuntime,
+		adaptiveRuntime: learningAdaptiveRuntime,
 		scheduler: taskRuntime.scheduler,
 		executionEvidence: input.executionEvidence,
 		skillExecution,
@@ -3221,6 +3277,7 @@ function createDefaultTaskGraph(input: {
 interface DefaultLearningRuntime {
 	readonly runtime: WorkflowLearningRuntimeAdapter;
 	readonly recordAutoResearchOutcome: (result: AutoResearchPythonResult) => Promise<void>;
+	readonly recordEfficiencyReview: (reviewRef: WorkflowArtifactRef) => Promise<void>;
 	readonly reviewExperience: (experienceId: string) => Promise<Record<string, unknown>>;
 	readonly rollbackCandidate: (candidateId: string) => Promise<Record<string, unknown>>;
 	readonly pipeline: PrimeWorkflowPipelineRuntime;
@@ -4951,9 +5008,39 @@ async function createDefaultLearningRuntime(
 			};
 		});
 	};
+	/**
+	 * Turn a completed adaptive efficiency review into a learning experience.
+	 *
+	 * The adaptive runtime has always computed these reviews and then dropped them: the review is
+	 * published as evidence and nothing reads it. Its own source says to apply the recommendation
+	 * "through the normal approval and learning gates", which was a description of a path that did not
+	 * exist. This is that path.
+	 *
+	 * The review carries no candidate, which the trigger contract already allows — candidateId is
+	 * nullable and only asserted non-empty when present. The experience stays non-authoritative: it is
+	 * recorded, and the promotion authority still decides whether anything changes.
+	 *
+	 * Args:
+	 * reviewRef: Evidence artifact the adaptive runtime published for this review.
+	 * Return: No value; failures are surfaced by the caller's lease wrapper.
+	 */
+	const recordEfficiencyReview = async (reviewRef: WorkflowArtifactRef): Promise<void> => {
+		const trustedNow = input.now?.() ?? new Date().toISOString();
+		const trigger = await issueLearningTrigger({
+			kind: "efficiency_review",
+			candidateId: null,
+			sourceEventRef: reviewRef,
+			evidenceRefs: [reviewRef],
+			trustedNow,
+		});
+		await learningContext.run({ evidenceId: `learning-efficiency-${reviewRef.digest}`, trustedNow }, async () => {
+			await runtime.handleTrigger(trigger);
+		});
+	};
 	return Object.freeze({
 		runtime,
 		recordAutoResearchOutcome,
+		recordEfficiencyReview,
 		reviewExperience,
 		rollbackCandidate,
 		pipeline,
