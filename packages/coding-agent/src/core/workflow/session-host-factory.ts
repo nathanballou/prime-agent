@@ -253,6 +253,12 @@ export interface PersistedSessionWorkflowHostInput {
 	/** Canonical host ResourceLoader used by the default Prime composition. */
 	/** Roots a workflow task may own paths under; absent keeps the built-in default. */
 	readonly primeWorkflowWorkspacePaths?: readonly string[];
+	/** Metric command the host runs to measure a candidate. */
+	readonly primeWorkflowMetricCommand?: {
+		readonly command: string;
+		readonly args: readonly string[];
+		readonly timeoutMs: number;
+	};
 	readonly primeWorkflowResourceLoader?: WorkflowResourceLoaderPort;
 	/** Authenticated evaluator that supplies durable readiness, decisions, and canonical validators. */
 	readonly completionReadinessAuthorityFactory?: PersistedWorkflowCompletionReadinessAuthorityFactory;
@@ -1463,6 +1469,7 @@ export async function createPersistedSessionWorkflowHost(
 			...(input.primeWorkflowWorkspacePaths === undefined
 				? {}
 				: { workspacePaths: input.primeWorkflowWorkspacePaths }),
+			...(input.primeWorkflowMetricCommand === undefined ? {} : { metricCommand: input.primeWorkflowMetricCommand }),
 			readStatus: () => {
 				if (phaseHost === undefined) throw new Error("workflow_phase_host_not_initialized");
 				return phaseHost.status();

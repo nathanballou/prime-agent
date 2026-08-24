@@ -3,6 +3,7 @@
  */
 
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import { heartbeatPromptWarning } from "../../core/heartbeat-prompt.js";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { InProcessAgentConnection } from "../agent-connection/in-process-agent-connection.js";
@@ -362,10 +363,15 @@ async function runRpcModeWithConnectionInternal(
 				return success(id, command.type, { heartbeats: await connection.listHeartbeats() });
 			case "get_heartbeat":
 				return success(id, command.type, { heartbeat: (await connection.getHeartbeat()) ?? null });
-			case "set_heartbeat":
+			case "set_heartbeat": {
+				// Advisory only: the heartbeat is still set. A prompt that asks for status and never
+				// says to continue produces a report-and-halt loop that looks healthy from outside.
+				const promptWarning = heartbeatPromptWarning(command.prompt);
 				return success(id, command.type, {
 					heartbeat: await connection.setHeartbeat(command.schedule, command.prompt, command.deliveryMode),
+					...(promptWarning === undefined ? {} : { warning: promptWarning }),
 				});
+			}
 			case "update_heartbeat":
 				return success(id, command.type, {
 					heartbeat: (await connection.updateHeartbeat(command.action)) ?? null,

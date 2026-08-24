@@ -179,7 +179,11 @@ export const DEFAULT_STREAM_LIVENESS_POLICY: StreamLivenessPolicy = Object.freez
 	headersTimeoutMs: 300_000,
 	streamingIdleTimeoutMs: 60_000,
 	finalizingTimeoutMs: 30_000,
-	progressExtensionMs: 10_000,
+	// What a single visible delta buys. At 10_000 this was shorter than the gap a reasoning model
+	// leaves between summary parts, so a stream making demonstrable progress still died — the watchdog
+	// killed exactly the turns progress was meant to protect. The total ceiling below is unchanged and
+	// still bounds a chatty-but-hung producer.
+	progressExtensionMs: 60_000,
 	maxProgressExtensionMs: 300_000,
 });
 

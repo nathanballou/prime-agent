@@ -742,6 +742,60 @@ describe("provider stream liveness watchdog", () => {
 	});
 });
 
+describe("default stream liveness policy streaming bound", () => {
+	test("visible progress every 20s keeps a reasoning stream alive within the total ceiling", () => {
+		// progressExtensionMs is the grant a single delta buys. If it is shorter than a plausible gap
+		// between summary parts, then a stream that is demonstrably making progress still dies — the
+		// watchdog kills exactly the turns it should be protecting. This is the streaming-phase twin of
+		// the headers cliff that killed 150 turns at 30s.
+		const runtime = new FakeRuntime();
+		const outcomes: unknown[] = [];
+		const watchdog = makeWatchdog(runtime, {
+			policy: DEFAULT_STREAM_LIVENESS_POLICY,
+			onTerminal: (outcome) => outcomes.push(outcome),
+		});
+
+		watchdog.observe({ type: "headers" });
+		watchdog.observe({ type: "block", receivedBytes: 64 });
+		// Five minutes of steady, visible reasoning at 20s intervals — deliberately inside the total
+		// ceiling (streamingIdleTimeoutMs + maxProgressExtensionMs), so this tests the per-delta grant
+		// and not the ceiling. The ceiling is a separate, deliberate policy choice; see the note below.
+		for (let elapsed = 0; elapsed < 300_000; elapsed += 20_000) {
+			runtime.advance(20_000);
+			watchdog.observe({ type: "thinking_delta", delta: `step ${elapsed}` });
+		}
+		expect(outcomes).toEqual([]);
+	});
+
+	test("still stalls a silent stream at a finite bound after progress stops", () => {
+		// The safety property: tolerating a slow producer must not make a dead one immortal.
+		const runtime = new FakeRuntime();
+		const outcomes: unknown[] = [];
+		const watchdog = makeWatchdog(runtime, {
+			policy: DEFAULT_STREAM_LIVENESS_POLICY,
+			onTerminal: (outcome) => outcomes.push(outcome),
+		});
+
+		watchdog.observe({ type: "headers" });
+		watchdog.observe({ type: "block", receivedBytes: 64 });
+		watchdog.observe({ type: "thinking_delta", delta: "last thing it ever said" });
+		runtime.advance(
+			DEFAULT_STREAM_LIVENESS_POLICY.streamingIdleTimeoutMs +
+				DEFAULT_STREAM_LIVENESS_POLICY.maxProgressExtensionMs +
+				1_000,
+		);
+
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]).toMatchObject({ type: "provider_stream_stalled" });
+	});
+
+	test("a single delta must buy more time than a plausible gap between deltas", () => {
+		// Guards the contradiction directly: if the grant is smaller than the interval a reasoning model
+		// emits at, progress cannot preserve liveness no matter how much of it there is.
+		expect(DEFAULT_STREAM_LIVENESS_POLICY.progressExtensionMs).toBeGreaterThanOrEqual(30_000);
+	});
+});
+
 describe("default stream liveness policy headers bound", () => {
 	// Observed 2026-08 with provider "openai-codex", model gpt-5.6-sol at thinking level "high":
 	// headers at 319ms, one ~89KB response.created at 1045ms, then no wire traffic while the model

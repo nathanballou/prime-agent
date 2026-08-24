@@ -1,7 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { execFile } from "node:child_process";
 import { mkdir, readdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { getBundledSkillsDir } from "../../config.js";
+import { type MetricCommandMeasurement, parseMetricCommandOutput } from "../autoresearch/metric-command.js";
 import {
 	type AutoResearchDurableRecipe,
 	type AutoResearchProductionRunner,
@@ -24,7 +27,12 @@ import type {
 } from "../autoresearch/types.js";
 import type { Skill } from "../skills.js";
 import { loadSkillsFromDir } from "../skills.js";
-import { createPrimeAdaptiveRuntime, type PrimeAdaptiveRuntimeHostAuthority } from "./adaptive-runtime.js";
+import {
+	createPrimeAdaptiveRuntime,
+	type PrimeAdaptiveRuntime,
+	type PrimeAdaptiveRuntimeHostAuthority,
+	type PrimeAdaptiveRuntimeState,
+} from "./adaptive-runtime.js";
 import {
 	assertWorkflowTaskGraphSourceContract,
 	readWorkflowTaskGraphSource,
@@ -560,6 +568,8 @@ export interface DefaultPrimeWorkflowProviderInput {
 	/** Optional caller loader is ignored for built-in admission; canonical vendored resources are host-owned. */
 	/** Roots a task may own paths under; absent keeps DEFAULT_WORKSPACE_PATHS. */
 	readonly workspacePaths?: readonly string[];
+	/** Command the host runs to measure a candidate; absent keeps the measurement refusing. */
+	readonly metricCommand?: { readonly command: string; readonly args: readonly string[]; readonly timeoutMs: number };
 	readonly resourceLoader?: WorkflowResourceLoaderPort;
 	readonly readStatus: () => WorkflowShellStatus;
 	readonly executionEvidence: WorkflowExecutionEvidenceRuntime;
@@ -659,6 +669,8 @@ function orderedTaskGraphSourceTaskIds(source: WorkflowTaskGraphSource): readonl
  * input: The one persisted runtime, receipt authority, descriptor root, and canonical ResourceLoader.
  * Return: A lazy provider which waits for a durable workflow head before issuing immutable admissions.
  */
+const execFileAsync = promisify(execFile);
+
 export function createDefaultPrimeWorkflowProvider(
 	input: DefaultPrimeWorkflowProviderInput,
 ): DefaultPrimeWorkflowProvider {
@@ -836,7 +848,7 @@ async function composeDefaultPrimeWorkflow(
 	const autoResearchRecipe =
 		persistedAutoResearchRecipe ?? (await createDefaultAutoResearchRecipe(input, snapshots, replay, decisionRef));
 	if (persistedAutoResearchRecipe === undefined) await persistAutoResearchRecipe(input, autoResearchRecipe);
-	const autoResearchRunner = await createDefaultAutoResearchRunner(input, autoResearchRecipe);
+	const autoResearchRunner = (await createDefaultAutoResearchParts(input, autoResearchRecipe)).runner;
 	const consumeRecipeAdmission = await createDefaultRecipeAdmissionConsumer(input, snapshots.recipe);
 	const runId = `prime:${input.workflowId}:${replay.head.eventDigest}`;
 	const executionKey = digestObject({
@@ -1030,6 +1042,57 @@ async function composeDefaultPrimeWorkflow(
 					}),
 	});
 	await adaptiveRuntime.recover(defaultLearning.pipeline.current());
+	/**
+	 * Total reviews this state has produced, by either route.
+	 *
+	 * A pipeline transition bumps reviewCount and a scheduled window bumps periodicReviewCount; they are
+	 * separate counters for the same artifact kind. Watching only the first silently drops every
+	 * scheduled review, which is the failure this wiring exists to end.
+	 *
+	 * Args:
+	 * state: Adaptive runtime state to total.
+	 * Return: Combined count of reviews produced.
+	 */
+	const totalReviews = (state: PrimeAdaptiveRuntimeState): number => state.reviewCount + state.periodicReviewCount;
+	/**
+	 * Feed a review that actually happened into learning.
+	 *
+	 * Guarded on the total moving rather than on the ref being present: a review that was not due
+	 * returns the prior state, ref and all, and re-recording that would manufacture an experience per
+	 * commit. Recovery deliberately does not go through here — replaying a run must not re-learn from it.
+	 *
+	 * Failures are swallowed by design. A review is advisory and holds no authority, while the callers
+	 * are a durable stage commit and the session host's periodic sweep. Learning also bounds its trigger
+	 * history, and at a five-minute cadence a long run reaches that bound; letting the resulting throw
+	 * escape would fail the stage commit that happened to be next. An unrecorded review costs a
+	 * suggestion, so it must never be able to break the run it is commenting on.
+	 *
+	 * Args:
+	 * reviewsBefore: Combined review count observed before the call that may have produced one.
+	 * state: State the adaptive runtime returned.
+	 * Return: That same state, so callers can wrap in place.
+	 */
+	const recordReviewIfNew = async (
+		reviewsBefore: number,
+		state: PrimeAdaptiveRuntimeState,
+	): Promise<PrimeAdaptiveRuntimeState> => {
+		if (totalReviews(state) > reviewsBefore && state.latestReviewRef !== null)
+			await defaultLearning.recordEfficiencyReview(state.latestReviewRef).catch(() => undefined);
+		return state;
+	};
+	// Wrapping here rather than at the call sites because reviews arrive by two routes - a pipeline
+	// commit and the periodic sweep the session host drives - and the session host reads this same
+	// object off the exposed parts. One wrapper covers both without plumbing learning across modules.
+	const learningAdaptiveRuntime: PrimeAdaptiveRuntime = Object.freeze({
+		...adaptiveRuntime,
+		onPipelineCommitted: async (committed: PrimeWorkflowPipelineState) =>
+			recordReviewIfNew(
+				totalReviews(adaptiveRuntime.current()),
+				await adaptiveRuntime.onPipelineCommitted(committed),
+			),
+		reviewIfDue: async () =>
+			recordReviewIfNew(totalReviews(adaptiveRuntime.current()), await adaptiveRuntime.reviewIfDue()),
+	});
 	const pipeline: PrimeWorkflowPipelineRuntime = Object.freeze({
 		current: () => defaultLearning.pipeline.current(),
 		read: () => defaultLearning.pipeline.read(),
@@ -1037,7 +1100,7 @@ async function composeDefaultPrimeWorkflow(
 			const classification = await taskRuntime.prime.recordEvidence(request);
 			await taskRuntime.assertStageAcceptable({ stageId: request.stageId, classification });
 			const state = await defaultLearning.pipeline.record(request);
-			await adaptiveRuntime.onPipelineCommitted(state);
+			await learningAdaptiveRuntime.onPipelineCommitted(state);
 			await taskRuntime.acceptStage({ stageId: request.stageId, classification });
 			return state;
 		},
@@ -1234,7 +1297,7 @@ async function composeDefaultPrimeWorkflow(
 		},
 		completionRequestHandler,
 		pipeline,
-		adaptiveRuntime,
+		adaptiveRuntime: learningAdaptiveRuntime,
 		scheduler: taskRuntime.scheduler,
 		executionEvidence: input.executionEvidence,
 		skillExecution,
@@ -1585,10 +1648,28 @@ async function createDefaultAutoResearchRecipe(
 	};
 }
 
-async function createDefaultAutoResearchRunner(
+/** The AutoResearch host ports and the production runner composed over them. */
+export interface DefaultAutoResearchParts {
+	readonly host: AutoResearchHostPorts;
+	readonly runner: AutoResearchProductionRunner;
+}
+
+/**
+ * Compose the host-owned AutoResearch loop for this workflow.
+ *
+ * The host is returned next to the runner because `measureObservation` is where the operator's metric
+ * command actually runs, and the runner exposes `run` only - so holding the host is the only way to
+ * prove the measurement executes a command rather than reporting a constant.
+ *
+ * Args:
+ * input: Provider input carrying the runtime store, artifact resolver, status reader, and metric command.
+ * recipe: The durable recipe whose registration every measurement is bound to.
+ * Return: The host ports and the runner built over them.
+ */
+export async function createDefaultAutoResearchParts(
 	input: DefaultPrimeWorkflowProviderInput,
 	recipe: AutoResearchDurableRecipe,
-): Promise<AutoResearchProductionRunner> {
+): Promise<DefaultAutoResearchParts> {
 	const runtime = createAutoResearchWorkflowRuntimeAdapter({
 		runtimeStore: input.runtimeStore,
 		artifactResolver: input.artifactResolver,
@@ -2092,11 +2173,41 @@ async function createDefaultAutoResearchRunner(
 				)
 					throw new Error("default_prime_autoresearch_result_invalid");
 			}
-			// This host executes nothing: `effect-broker.ts` implements command execution but nothing in
-			// production constructs it, and the registration commits to its evaluator by bare digest with
-			// no retrievable command text. So there is no measurement to report. Reporting one anyway -
-			// metricValue 0 against baseline 1, cost and latency derived from artifact byte length - is
-			// what this did before, and a constant that reads as evidence is worse than an absence.
+			// Measure by running the operator's configured command, in the workspace, and reading its
+			// stdout. The host has to produce the number: one reported by the worker being judged is a
+			// claim, not evidence. Every failure below stays "crashed" with the reason recorded, because
+			// the engine refuses to promote a crashed observation - so a candidate can never be accepted
+			// on the strength of a measurement that did not happen.
+			const metricCommand = input.metricCommand;
+			let measured: MetricCommandMeasurement | undefined;
+			let measuredLatencyMs = 0;
+			let measurementRejection = "workflow_metric_command_unconfigured";
+			if (metricCommand !== undefined) {
+				const startedAt = Date.now();
+				const executed = await execFileAsync(metricCommand.command, [...metricCommand.args], {
+					// The provider runs in the session process, whose cwd is the repository root — the same
+					// root the scope and immutable-path checks ask git about.
+					cwd: process.cwd(),
+					timeout: metricCommand.timeoutMs,
+					maxBuffer: 8 * 1024 * 1024,
+				}).then(
+					(result) => ({ stdout: result.stdout }),
+					(error: unknown) => ({ failure: error instanceof Error ? error.message : String(error) }),
+				);
+				measuredLatencyMs = Date.now() - startedAt;
+				if ("failure" in executed) {
+					measurementRejection = `workflow_metric_command_failed:${executed.failure}`;
+				} else {
+					const parsed = parseMetricCommandOutput(executed.stdout);
+					if ("error" in parsed) measurementRejection = `workflow_metric_command_invalid:${parsed.error}`;
+					else measured = parsed;
+				}
+			}
+			// Before the operator's metric command existed, this host executed nothing and reported
+			// metricValue 0 against baseline 1 with cost and latency derived from artifact byte length.
+			// A constant that reads as evidence is worse than an absence, so it reported absence instead.
+			// The measurement above is now real when a command is configured and succeeds; what follows
+			// is the absence path, which still matters because most failures land in it.
 			//
 			// "crashed" is that absence, stated in the engine's own vocabulary: it refuses to reuse a
 			// crashed observation for promotion, so a candidate cannot be accepted on the strength of a
@@ -2107,17 +2218,17 @@ async function createDefaultAutoResearchRunner(
 				source: "host" as const,
 				rawResultRefsDigest: digestObject(observation.rawResultRefs),
 				phase: "promotion" as const,
-				status: "crashed" as const,
+				status: measured === undefined ? ("crashed" as const) : ("complete" as const),
 				commandInputBinding: recipe.registration.commandInputBinding,
 				metricDirection: recipe.registration.metric.direction,
 				metricTarget: recipe.registration.metric.target,
 				metricTolerance: recipe.registration.metric.tolerance,
 				// The engine requires a positive sample count; the refusal is carried by `status`, not by
 				// pretending zero samples were taken.
-				sampleCount: observation.rawResultRefs.length,
-				metricValue: 0,
-				baselineMetricValue: 0,
-				variance: 0,
+				sampleCount: measured?.sampleCount ?? observation.rawResultRefs.length,
+				metricValue: measured?.metricValue ?? 0,
+				baselineMetricValue: measured?.baselineMetricValue ?? 0,
+				variance: measured?.variance ?? 0,
 				fixtureManifestDigest: recipe.registration.fixtures
 					.filter((fixture) => fixture.partition === "train" || fixture.partition === "eval")
 					.map((fixture) => fixture.manifestDigest)
@@ -2132,9 +2243,9 @@ async function createDefaultAutoResearchRunner(
 				parserDigest: recipe.registration.evaluator.parserDigest,
 				guardDigest: recipe.registration.guard?.guardDigest ?? null,
 				seedDigest: recipe.registration.seed.seedDigest,
-				proxySignals: [],
-				costMicrounits: 0,
-				latencyMilliseconds: 0,
+				proxySignals: measured === undefined ? [measurementRejection] : [],
+				costMicrounits: measured?.costMicrounits ?? 0,
+				latencyMilliseconds: measuredLatencyMs,
 				resourceUsage: defaultPrimeAutoResearchResourceVector(1),
 				hiddenMetricValue: 0,
 				adversarialMetricValue: 0,
@@ -2148,7 +2259,7 @@ async function createDefaultAutoResearchRunner(
 		},
 		runtime,
 	};
-	return createAutoResearchProductionRunner({
+	const runner = createAutoResearchProductionRunner({
 		host,
 		authority: {
 			runtimeStore: input.runtimeStore,
@@ -2194,6 +2305,7 @@ async function createDefaultAutoResearchRunner(
 			return { rawResultRefs: [resultRef] };
 		},
 	});
+	return { host, runner };
 }
 
 function recipeSignedReceiptPreimageDigest(receipt: WorkflowVerifiedHostReceipt): string {
@@ -3165,6 +3277,7 @@ function createDefaultTaskGraph(input: {
 interface DefaultLearningRuntime {
 	readonly runtime: WorkflowLearningRuntimeAdapter;
 	readonly recordAutoResearchOutcome: (result: AutoResearchPythonResult) => Promise<void>;
+	readonly recordEfficiencyReview: (reviewRef: WorkflowArtifactRef) => Promise<void>;
 	readonly reviewExperience: (experienceId: string) => Promise<Record<string, unknown>>;
 	readonly rollbackCandidate: (candidateId: string) => Promise<Record<string, unknown>>;
 	readonly pipeline: PrimeWorkflowPipelineRuntime;
@@ -4895,9 +5008,39 @@ async function createDefaultLearningRuntime(
 			};
 		});
 	};
+	/**
+	 * Turn a completed adaptive efficiency review into a learning experience.
+	 *
+	 * The adaptive runtime has always computed these reviews and then dropped them: the review is
+	 * published as evidence and nothing reads it. Its own source says to apply the recommendation
+	 * "through the normal approval and learning gates", which was a description of a path that did not
+	 * exist. This is that path.
+	 *
+	 * The review carries no candidate, which the trigger contract already allows — candidateId is
+	 * nullable and only asserted non-empty when present. The experience stays non-authoritative: it is
+	 * recorded, and the promotion authority still decides whether anything changes.
+	 *
+	 * Args:
+	 * reviewRef: Evidence artifact the adaptive runtime published for this review.
+	 * Return: No value; failures are surfaced by the caller's lease wrapper.
+	 */
+	const recordEfficiencyReview = async (reviewRef: WorkflowArtifactRef): Promise<void> => {
+		const trustedNow = input.now?.() ?? new Date().toISOString();
+		const trigger = await issueLearningTrigger({
+			kind: "efficiency_review",
+			candidateId: null,
+			sourceEventRef: reviewRef,
+			evidenceRefs: [reviewRef],
+			trustedNow,
+		});
+		await learningContext.run({ evidenceId: `learning-efficiency-${reviewRef.digest}`, trustedNow }, async () => {
+			await runtime.handleTrigger(trigger);
+		});
+	};
 	return Object.freeze({
 		runtime,
 		recordAutoResearchOutcome,
+		recordEfficiencyReview,
 		reviewExperience,
 		rollbackCandidate,
 		pipeline,

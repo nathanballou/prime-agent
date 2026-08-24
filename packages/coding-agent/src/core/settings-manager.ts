@@ -174,6 +174,7 @@ export interface Settings {
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 	workflowWorkerModelsByComputeClass?: Partial<Record<WorkflowComputeClass, string>>; // Model selector per Prime workflow compute-class tier ("cheap"/"standard"/"deep"); unset tiers fall back to the session default
 	workflowImmutablePaths?: string[]; // Repo-relative path prefixes no workflow task may change; the host reports any write under them from git, without running anything
+	workflowMetricCommand?: { command: string; args?: string[]; timeoutMs?: number }; // Command the host runs to measure an autoresearch candidate; its stdout must carry a JSON metricValue
 	workflowWorkspacePaths?: string[]; // Repo-relative roots a workflow task may own paths under; defaults to ["src"], which rejects ownership of code anywhere else
 	agentMessageMidRunDelivery?: boolean; // Deliver an agent-to-agent message at the recipient's next turn boundary instead of waiting for its whole task to finish. Off by default: mid-run delivery keeps the recipient's loop alive, so mutual sends can hold each other running.
 	agentCollaboration?: Partial<AgentCollaborationOptions>; // How sibling workers share work: mode "blind" | "push_diffs" | "full_comms", plus midRunDelivery, finalCheck, maxDiffBytes
@@ -1138,6 +1139,27 @@ export class SettingsManager {
 	getWorkflowWorkspacePaths(): readonly string[] | undefined {
 		const paths = this.settings.workflowWorkspacePaths;
 		return paths === undefined || paths.length === 0 ? undefined : paths;
+	}
+
+	/**
+	 * Command the host runs to measure a candidate.
+	 *
+	 * The host has to produce the metric itself: a number reported by the worker being judged is not
+	 * evidence, it is a claim. So an absent or unusable setting leaves the measurement refusing rather
+	 * than falling back to a default command that nobody chose.
+	 *
+	 * Return: Normalized command, or undefined when unset or unusable.
+	 */
+	getWorkflowMetricCommand(): { command: string; args: readonly string[]; timeoutMs: number } | undefined {
+		const configured = this.settings.workflowMetricCommand;
+		const command = configured?.command?.trim();
+		if (command === undefined || command.length === 0) return undefined;
+		const declaredTimeout = configured?.timeoutMs;
+		const timeoutMs =
+			typeof declaredTimeout === "number" && Number.isSafeInteger(declaredTimeout) && declaredTimeout > 0
+				? declaredTimeout
+				: 600_000;
+		return { command, args: [...(configured?.args ?? [])], timeoutMs };
 	}
 
 	getWorkflowImmutablePaths(): readonly string[] | undefined {
