@@ -202,9 +202,9 @@ export interface AgentSessionWorkflowHostFactoryInput {
 	primeWorkflowResourceLoader?: WorkflowResourceLoaderPort;
 	/** Roots a workflow task may own paths under; absent keeps the built-in default. */
 	primeWorkflowWorkspacePaths?: readonly string[];
-	/** Metric command the host runs to measure a candidate. */
 	/** Session working directory, so the metric command scores the session's repository. */
 	primeWorkflowSessionCwd?: string;
+	/** Metric command the host runs to measure a candidate. */
 	primeWorkflowMetricCommand?: {
 		readonly command: string;
 		readonly args: readonly string[];

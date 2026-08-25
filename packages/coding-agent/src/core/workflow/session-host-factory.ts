@@ -253,9 +253,9 @@ export interface PersistedSessionWorkflowHostInput {
 	/** Canonical host ResourceLoader used by the default Prime composition. */
 	/** Roots a workflow task may own paths under; absent keeps the built-in default. */
 	readonly primeWorkflowWorkspacePaths?: readonly string[];
-	/** Metric command the host runs to measure a candidate. */
 	/** Session working directory, forwarded so the metric command scores the session's repository. */
 	readonly primeWorkflowSessionCwd?: string;
+	/** Metric command the host runs to measure a candidate. */
 	readonly primeWorkflowMetricCommand?: {
 		readonly command: string;
 		readonly args: readonly string[];

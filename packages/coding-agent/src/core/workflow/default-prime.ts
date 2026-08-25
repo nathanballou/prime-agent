@@ -2197,9 +2197,11 @@ export async function createDefaultAutoResearchParts(
 			if (metricCommand !== undefined) {
 				const startedAt = Date.now();
 				const executed = await execFileAsync(metricCommand.command, [...metricCommand.args], {
-					// The session's cwd, not process.cwd(). A resumed session takes its directory from its
-					// own recorded header while the worker process stays where the daemon was started, so
-					// process.cwd() can point at an entirely different repository than the one being scored.
+					// The session's cwd, which is the root the scope and immutable-path checks ask git about
+					// (_reportScopeViolations reads sessionManager.getCwd()). Not process.cwd(): a resumed
+					// session takes its directory from its own recorded header while the worker process stays
+					// where the daemon was started, so the two disagree and process.cwd() can point at an
+					// entirely different repository than the one being scored.
 					cwd: input.sessionCwd,
 					timeout: metricCommand.timeoutMs,
 					maxBuffer: 8 * 1024 * 1024,

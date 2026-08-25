@@ -1,9 +1,16 @@
-import { chmod, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+	type AgentSessionWorkflowHostFactory,
+	createAgentSessionFromServices,
+	createAgentSessionServices,
+} from "../src/core/agent-session-services.js";
 import type { AutoResearchHostMeasurement, AutoResearchHostPorts } from "../src/core/autoresearch/engine.js";
 import type { AutoResearchDurableRecipe } from "../src/core/autoresearch/runner.js";
+import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import { canonicalJsonBytes, digestObject, type WorkflowArtifactRef } from "../src/core/workflow/contracts.js";
 import {
 	createDefaultAutoResearchParts,
@@ -294,6 +301,74 @@ describe("default Prime autoresearch host measurement", () => {
 		expect(measurement.status).toBe("complete");
 		const observed = (await readFile(marker, "utf8")).trim();
 		expect(observed).toBe(sessionDir);
+		expect(observed).not.toBe(await realpath(process.cwd()));
+	});
+
+	it("measures a resumed session's own directory rather than the worker process's", async () => {
+		// The provider case above proves the command follows `sessionCwd`. This one proves the live
+		// composition puts the right value there: a resumed session takes its directory from its own
+		// recorded header while the worker process stays where the daemon was started, so the two hops
+		// between the session and the provider are what decide which repository gets scored. They were
+		// each checked at their ends and nowhere as a whole, and the host factory defaults a missing
+		// value to process.cwd() — so dropping the forward would silently restore the bug.
+		const root = await realpath(await mkdtemp(join(tmpdir(), "metric-command-resume-")));
+		const savedCwd = join(root, "saved-project");
+		const sessionDir = join(root, "sessions");
+		await mkdir(savedCwd, { recursive: true });
+		const seed = SessionManager.create(savedCwd, sessionDir);
+		seed.appendSessionInfo("saved-session");
+		const sessionPath = seed.getSessionFile();
+		if (sessionPath === undefined) throw new Error("saved session file missing");
+
+		// No cwdOverride: the resume the supervisor performs when the caller asked for no directory.
+		const sessionManager = await SessionManager.openAsync(sessionPath, sessionDir);
+		expect(sessionManager.getCwd()).toBe(savedCwd);
+		expect(sessionManager.getCwd()).not.toBe(process.cwd());
+
+		const marker = join(root, "observed-cwd");
+		const script = join(root, "measure.sh");
+		await writeFile(
+			script,
+			`#!/bin/sh\npwd -P > ${marker}\necho '{"metricValue":1,"baselineMetricValue":2,"sampleCount":1,"variance":0}'\n`,
+		);
+		await chmod(script, 0o755);
+
+		let received: Parameters<AgentSessionWorkflowHostFactory>[0] | undefined;
+		const services = await createAgentSessionServices({
+			// The value daemon-mode hands createAgentSessionRuntime for a resumed session.
+			cwd: sessionManager.getCwd(),
+			agentDir: root,
+			settingsManager: SettingsManager.inMemory({
+				workflowMetricCommand: { command: script, args: [], timeoutMs: 30_000 },
+			}),
+			workflowHostFactory: async (input) => {
+				received = input;
+				throw new Error("session_cwd_forwarding_probe");
+			},
+			resourceLoaderOptions: { noPromptTemplates: true, noThemes: true },
+		});
+		await expect(createAgentSessionFromServices({ services, sessionManager })).rejects.toThrow(
+			"session_cwd_forwarding_probe",
+		);
+
+		const metricCommand = received?.primeWorkflowMetricCommand;
+		if (metricCommand === undefined) throw new Error("composition delivered no metric command");
+
+		// Measure through the real provider at the directory the composition delivered, resolving it the
+		// way the host factory does. That default is deliberate here rather than asserted away: if the
+		// forward is dropped the command runs at process.cwd() instead of failing, which is the silent
+		// shape of the bug, and the observed working directory below is what catches it.
+		const host = await hostWith(metricCommand, received?.primeWorkflowSessionCwd ?? process.cwd());
+		const measurement = await host.measureObservation({
+			observationId: "observation-1",
+			candidateId: CANDIDATE_ID,
+			attemptId: ATTEMPT_ID,
+			rawResultRefs: [resultRef],
+		});
+
+		expect(measurement.status).toBe("complete");
+		const observed = (await readFile(marker, "utf8")).trim();
+		expect(observed).toBe(savedCwd);
 		expect(observed).not.toBe(await realpath(process.cwd()));
 	});
 
