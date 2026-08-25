@@ -1632,6 +1632,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const worker = {
 			descriptor: {
 				workerId: "failed-unreclaimed",
+				pid: 52668,
 				rootActiveSessionId: "active-failed",
 				lifecycle: "failed",
 			},
@@ -1640,7 +1641,9 @@ describe("daemon worker supervisor monitoring", () => {
 			reuseWorkerForCreate(target: typeof worker, ownerClientId: undefined, sessionPath: string): typeof worker;
 		};
 
-		expect(() => supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/failed.jsonl")).toThrow(/failed worker/);
+		expect(() => supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/failed.jsonl")).toThrow(
+			/failed worker failed-unreclaimed.*pid 52668/s,
+		);
 	});
 
 	it("ignores conflicting paths on workers unrelated to a session lookup", () => {
@@ -1697,7 +1700,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.has(worker.descriptor.workerId)).toBe(false);
 	});
 
-	it("stops only an identity-verified failed resident when a fresh create arrives", async () => {
+	it("stops a live failed resident so a create can reopen its session", async () => {
 		const worker = {
 			descriptor: {
 				workerId: "failed-live-resident",
@@ -1713,13 +1716,54 @@ describe("daemon worker supervisor monitoring", () => {
 			processIdentity: vi.fn(() => "current"),
 			stopWorker,
 		}) as {
-			reclaimStaleWorkerRegistration(target: typeof worker, freshCreate?: boolean): Promise<boolean>;
+			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
+		};
+
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
+		expect(stopWorker).toHaveBeenCalledWith(worker, true, true);
+	});
+
+	it("leaves a failed resident alone when its process identity cannot be verified", async () => {
+		const worker = {
+			descriptor: { workerId: "failed-unverifiable", pid: 42, lifecycle: "failed" as const },
+			intentionalStop: false,
+		};
+		const stopWorker = vi.fn(async () => {});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			processIdentity: vi.fn(() => "unknown"),
+			stopWorker,
+		}) as {
+			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
 		};
 
 		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(false);
 		expect(stopWorker).not.toHaveBeenCalled();
-		await expect(supervisor.reclaimStaleWorkerRegistration(worker, true)).resolves.toBe(true);
-		expect(stopWorker).toHaveBeenCalledWith(worker, true, true);
+	});
+
+	it("names the pid and the attempted stop when a failed resident cannot be reclaimed", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "failed-unstoppable",
+				pid: 52668,
+				processStartId: "verified-start",
+				lifecycle: "failed" as const,
+			},
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			processIdentity: vi.fn(() => "current"),
+			stopWorker: vi.fn(async () => {
+				throw new Error("Session worker failed-unstoppable did not stop after SIGKILL");
+			}),
+		}) as {
+			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
+		};
+
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).rejects.toThrow(
+			/could not be stopped.*pid 52668.*did not stop after SIGKILL/s,
+		);
 	});
 
 	it("does not relaunch a live worker whose process identity is unknown", async () => {

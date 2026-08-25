@@ -177,8 +177,8 @@ function readSupervisorConfig(agentDir: string): { defaultSessionConfig?: { sess
 	throw new Error("Supervisor config was not persisted");
 }
 
-async function connectEventually(socketPath: string, child?: ChildProcess): Promise<DaemonClient> {
-	const deadline = Date.now() + 15_000;
+async function connectEventually(socketPath: string, child?: ChildProcess, timeoutMs = 15_000): Promise<DaemonClient> {
+	const deadline = Date.now() + timeoutMs;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		if (child && (child.exitCode !== null || child.signalCode !== null)) {
@@ -337,6 +337,87 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 	await waitForCondition(() => existsSync(readyPath), `Blocking bash process did not become ready: ${readyPath}`);
 }
 
+function processIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function readWorkerLifecycle(agentDir: string): string | undefined {
+	try {
+		return readWorkerDescriptor(agentDir).lifecycle;
+	} catch {
+		// The descriptor may be mid-rewrite.
+		return undefined;
+	}
+}
+
+/**
+ * Reproduce the state that locked a resident session out permanently: a worker
+ * process that is alive but unreachable, registered to a supervisor that has
+ * given up on it and persisted `lifecycle: "failed"`. SIGSTOP is what holds the
+ * worker unreachable, and it also keeps the orphan from launching a replacement
+ * supervisor of its own while this fixture installs one.
+ * Args:
+ * agentDir: Agent directory holding the daemon's worker descriptors.
+ * projectDir: Working directory for the supervisor and its worker.
+ * sessionDir: Directory holding the fixture session transcript.
+ * socketPath: Daemon socket shared by both supervisors.
+ * sessionFile: Saved session transcript the resident worker opens.
+ * Return: Client for the replacement supervisor, plus the wedged worker's
+ * summary and still-live pid.
+ */
+async function wedgeFailedWorkerWithLiveProcess(
+	agentDir: string,
+	projectDir: string,
+	sessionDir: string,
+	socketPath: string,
+	sessionFile: string,
+): Promise<{ client: DaemonClient; summary: SessionSummary; workerPid: number }> {
+	const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+	const firstClient = await connectEventually(socketPath, firstSupervisor);
+	const firstSupervisorPid = firstClient.hello?.supervisorPid;
+	if (!firstSupervisorPid) {
+		throw new Error("Daemon hello did not expose its supervisor pid");
+	}
+	const created = await firstClient.request({
+		type: "create",
+		sessionPath: sessionFile,
+		config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+	});
+	if (!created.success) {
+		throw new Error(created.error);
+	}
+	const summary = requireSummary(created.data);
+	const workerPid = summary.workerPid;
+	if (!workerPid) {
+		throw new Error("Resident worker did not expose its pid");
+	}
+	workerPids.add(workerPid);
+
+	process.kill(workerPid, "SIGSTOP");
+	process.kill(firstSupervisorPid, "SIGKILL");
+	await waitForExit(firstSupervisor);
+	children.delete(firstSupervisor);
+	firstClient.close();
+
+	// The supervisor only answers its handshake once every descriptor is adopted,
+	// and giving up on this unreachable worker takes three recovery attempts.
+	const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+	const client = await connectEventually(socketPath, replacementSupervisor, 60_000);
+	await waitForCondition(
+		() => readWorkerLifecycle(agentDir) === "failed",
+		"Replacement supervisor never marked the unreachable worker failed",
+		30_000,
+	);
+	if (!processIsAlive(workerPid)) {
+		throw new Error("Wedged worker process died before the reclaim could be exercised");
+	}
+	return { client, summary, workerPid };
+}
 describe("daemon supervisor resident workers", () => {
 	it("accepts the canonical socket path when launched with duplicate slashes", async () => {
 		if (process.platform === "win32") return;
@@ -1390,6 +1471,113 @@ describe("daemon supervisor resident workers", () => {
 			await waitForProcessGone(resumedSummary.workerPid);
 			workerPids.delete(resumedSummary.workerPid);
 		}
+	});
+
+	it("stops a live failed worker so its session can be recreated", {
+		tags: ["process-stress"],
+		timeout: 90_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-failed-live-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "reclaim me", timestamp: 1 });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+		const { client, summary, workerPid } = await wedgeFailedWorkerWithLiveProcess(
+			agentDir,
+			projectDir,
+			sessionDir,
+			socketPath,
+			sessionFile,
+		);
+
+		// The live process holds the session claim while the supervisor has given
+		// up on it, so the session is unreachable and unreclaimable. Recreating it
+		// must stop that worker and relaunch rather than refuse forever.
+		const recreated = await client.request(
+			{
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			},
+			30_000,
+		);
+		if (!recreated.success) {
+			throw new Error(`Recreating the session held by the failed worker was refused: ${recreated.error}`);
+		}
+		const recreatedSummary = requireSummary(recreated.data);
+		expect(recreatedSummary.sessionId).toBe(summary.sessionId);
+		expect(recreatedSummary.workerPid).not.toBe(workerPid);
+		expect(recreatedSummary.workerState).toBe("ready");
+		if (recreatedSummary.workerPid) {
+			workerPids.add(recreatedSummary.workerPid);
+		}
+
+		// Reclaim is stop-then-launch: the wedged process must be gone rather than
+		// left running alongside its replacement against the same session file.
+		await waitForProcessGone(workerPid);
+		workerPids.delete(workerPid);
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
+	});
+
+	it("recreates a session whose failed worker process is already gone", {
+		tags: ["process-stress"],
+		timeout: 90_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-failed-dead-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "reclaim me too", timestamp: 1 });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+		const { client, summary, workerPid } = await wedgeFailedWorkerWithLiveProcess(
+			agentDir,
+			projectDir,
+			sessionDir,
+			socketPath,
+			sessionFile,
+		);
+
+		process.kill(workerPid, "SIGKILL");
+		await waitForProcessGone(workerPid);
+		workerPids.delete(workerPid);
+
+		const recreated = await client.request(
+			{
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			},
+			30_000,
+		);
+		if (!recreated.success) {
+			throw new Error(`Recreating the session held by the failed worker was refused: ${recreated.error}`);
+		}
+		const recreatedSummary = requireSummary(recreated.data);
+		expect(recreatedSummary.sessionId).toBe(summary.sessionId);
+		expect(recreatedSummary.workerState).toBe("ready");
+		if (recreatedSummary.workerPid) {
+			workerPids.add(recreatedSummary.workerPid);
+		}
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
 	});
 
 	it("does not resurrect an intentionally stopped root when the supervisor dies during kill", {
