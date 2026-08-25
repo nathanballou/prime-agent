@@ -2290,7 +2290,12 @@ export class DaemonSupervisor {
 				activeMatches.length === 1 &&
 				!(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker, command.launchEnv !== undefined))
 			) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
+				return this.reuseWorkerForCreate(
+					activeMatches[0]!.worker,
+					ownerClientId,
+					command.sessionPath,
+					command.config?.cwd,
+				);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2302,7 +2307,7 @@ export class DaemonSupervisor {
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
-				return this.reuseWorkerForCreate(existing, ownerClientId, sessionPath);
+				return this.reuseWorkerForCreate(existing, ownerClientId, sessionPath, command.config?.cwd);
 			}
 		}
 		const key = createCommand.sessionPath
@@ -2343,6 +2348,7 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		requestedCwd?: string,
 	): ResidentWorker {
 		if (worker.descriptor.lifecycle === "failed") {
 			throw new Error(
@@ -2350,6 +2356,15 @@ export class DaemonSupervisor {
 			);
 		}
 		if (worker.descriptor.ownerClientId === ownerClientId) {
+			// A live session's working directory is fixed when its runtime opens. Report
+			// the conflict instead of handing back a session that runs somewhere other
+			// than where the caller asked for.
+			const activeCwd = worker.summaries.get(worker.descriptor.rootActiveSessionId)?.cwd;
+			if (requestedCwd && activeCwd && canonicalSessionPath(requestedCwd) !== canonicalSessionPath(activeCwd)) {
+				throw new Error(
+					`Session "${sessionPath}" is already active in ${activeCwd} and cannot be reopened in ${resolve(requestedCwd)}`,
+				);
+			}
 			return worker;
 		}
 		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
@@ -2450,9 +2465,14 @@ export class DaemonSupervisor {
 		}
 		const recoveryStopRevision = existing?.stopRevision;
 		const launchEnv = command.launchEnv ?? existing?.launchEnv;
+		const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
+		const workerProcessCwd = config.cwd ?? process.cwd();
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
-			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
+			// The worker reads config.cwd as an explicit caller override that outranks
+			// the resumed session's own recorded cwd, so forwarding a default-filled one
+			// would silently move every resumed session into the daemon's directory.
+			config: command.config?.cwd ? config : { ...config, cwd: undefined },
 		};
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
@@ -2481,7 +2501,7 @@ export class DaemonSupervisor {
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
-			cwd: createCommand.config?.cwd ?? process.cwd(),
+			cwd: workerProcessCwd,
 			detached: true,
 			env: workerEnvironment,
 			stdio: ["ignore", "ignore", "pipe", "pipe"],
