@@ -1007,6 +1007,9 @@ const HOST_REQUEST_DESCRIPTOR_LIST: readonly HostRequestDescriptor[] = Object.fr
 		{
 			recipe_digest: stringField({ required: true, maxChars: 64 }),
 			evidence_refs: arrayField({ required: true, maxItems: 32, items: ARTIFACT_REFERENCE_FIELD }),
+			// Which node the run acts for. Optional so a single qualifying node still infers, but
+			// without it a run started for one ready stage silently spoke for the whole workflow.
+			task_id: stringField({ required: false, maxChars: 128 }),
 		},
 		{ requiredCapability: "autoresearch.run", availability: "injectable" },
 	),

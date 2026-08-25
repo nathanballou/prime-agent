@@ -141,6 +141,14 @@ export interface DaemonWorkflowLeaseProjection {
 	readonly expiresAt?: string | null;
 }
 
+/** Which methodology one DAG node is in, and why. Node identity only; no payload or credential material. */
+export interface DaemonWorkflowSpecializationProjection {
+	readonly taskId: string;
+	readonly kind: "native_methodology" | "autoresearch";
+	readonly phaseTag: string;
+	readonly statusTag?: string;
+}
+
 /**
  * Safe, optional workflow metadata carried on daemon session summaries.
  *
@@ -159,6 +167,8 @@ export interface DaemonWorkflowStatusProjection {
 	readonly approvalRequest: DaemonWorkflowApprovalProjection | null;
 	readonly attempts?: readonly DaemonWorkflowAttemptProjection[];
 	readonly leases?: readonly DaemonWorkflowLeaseProjection[];
+	/** Per-node methodology; absent when the host exposes no task graph. */
+	readonly specializations?: readonly DaemonWorkflowSpecializationProjection[];
 }
 
 /** Synchronous seam used by the live session host to expose safe workflow metadata. */
@@ -172,6 +182,7 @@ const SPAWN_CODE_MAX_CHARS = 4000;
 const MAX_DATE_TIMESTAMP_MS = 8.64e15;
 const MAX_WORKFLOW_ATTEMPTS = 128;
 const MAX_WORKFLOW_LEASES = 128;
+const MAX_WORKFLOW_SPECIALIZATIONS = 128;
 
 // Lightweight daemon session shape used by list, create, rename, attach, and state responses.
 export interface SessionSummary {
@@ -601,6 +612,18 @@ function cloneWorkflowStatusProjection(projection: DaemonWorkflowStatusProjectio
 						status: lease.status,
 						...(lease.expiresAt !== undefined ? { expiresAt: lease.expiresAt } : {}),
 					})),
+				}
+			: {}),
+		...(projection.specializations !== undefined
+			? {
+					specializations: projection.specializations
+						.slice(0, MAX_WORKFLOW_SPECIALIZATIONS)
+						.map((specialization) => ({
+							taskId: specialization.taskId,
+							kind: specialization.kind,
+							phaseTag: specialization.phaseTag,
+							...(specialization.statusTag !== undefined ? { statusTag: specialization.statusTag } : {}),
+						})),
 				}
 			: {}),
 	};

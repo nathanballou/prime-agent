@@ -15,6 +15,8 @@ import type {
 	WorkflowResourceAdmission,
 	WorkflowResourceLease,
 	WorkflowRuntimeStore,
+	WorkflowSpecializationProjection,
+	WorkflowTaskSpecializationProjection,
 } from "./contracts.js";
 import { canonicalJsonBytes, digestObject, parseCanonicalJsonBytes, sha256Hex } from "./contracts.js";
 import type {
@@ -36,7 +38,7 @@ import { leaseRefOf } from "./dispatch.js";
 import type { WorkflowEffectBroker } from "./effect-broker.js";
 import type { WorkflowLeaseManager } from "./leases.js";
 import type { WorkflowExternalBlockerInput } from "./phase-host.js";
-import { WORKFLOW_WRITE_AUTHORITY_CAPABILITIES } from "./recipes.js";
+import { WORKFLOW_WRITE_AUTHORITY_CAPABILITIES, workflowSkillPromptLines } from "./recipes.js";
 import type { WorkflowReconciliationOutcome, WorkflowRecoveryRequest } from "./recovery.js";
 import type { WorkflowRuntimeRecoveryCoordinator } from "./runtime-recovery.js";
 import type { WorkflowScheduler, WorkflowSchedulerEvent, WorkflowSchedulerState } from "./scheduler.js";
@@ -58,6 +60,8 @@ const RUNTIME_EVENT_REBASE_LIMIT = 4;
 const TERMINAL_RESULT_PUBLICATION_RETRY_LIMIT = 4;
 const TERMINAL_RESULT_PUBLICATION_RETRY_DELAY_MILLISECONDS = 10;
 const TASK_RETRY_LIMIT = 1;
+const SPECIALIZATION_CONTRACT_VERSION = "1";
+const SPECIALIZATION_PHASE_TAGS = { native_methodology: "task_execution", autoresearch: "experiment" } as const;
 const DEFAULT_PRIME_HOST_COMPLETION_TOKEN: unique symbol = Symbol("default-prime-host-completion");
 const PROGRESS_REJECTED_RENEWAL_SIGNALS = [
 	"worker_activity",
@@ -317,6 +321,8 @@ interface DefaultTaskRuntimeState {
 	readonly terminalTaskIds: readonly string[];
 	readonly latestTelemetry: WorkflowTaskRuntimeTelemetry | null;
 	readonly progressRecoveryWake: DefaultTaskRuntimeProgressRecoveryWake | null;
+	/** Per-node methodology, one entry per graph task, re-derived whenever ready tasks are evaluated. */
+	readonly specializations: readonly WorkflowTaskSpecializationProjection[];
 	readonly stateDigest: string;
 }
 
@@ -487,6 +493,18 @@ export interface DefaultTaskRuntimeAuthorityInput {
 	) => Promise<"scheduled" | "already_scheduled">;
 	readonly readWorkflowStatus?: () => Pick<WorkflowShellStatus, "status" | "blocked">;
 	readonly beforeTaskLaunch?: (taskId: string) => Promise<void>;
+	/**
+	 * Whether the host can measure a candidate at all. Autoresearch is a measured methodology, so a
+	 * host with no metric command keeps every node in native methodology rather than entering a phase
+	 * whose verdict nothing can produce.
+	 */
+	readonly autoresearchMeasurable?: () => boolean;
+	/**
+	 * Nodes the active recipe declares as autoresearch stages, whose evidence contract only an
+	 * autoresearch run can satisfy. Their methodology is declared, not discovered, so readiness governs
+	 * only the nodes the recipe left open.
+	 */
+	readonly autoresearchContractedTaskIds?: readonly string[];
 	readonly workerLauncher?: DefaultPrimeWorkerLauncher;
 	readonly createTaskCapsule?: DefaultPrimeTaskCapsuleFactory;
 	readonly workerFailureDelivery?: (notice: DefaultPrimeWorkerFailureNotice) => Promise<void> | void;
@@ -520,6 +538,7 @@ function initialState(input: DefaultTaskRuntimeAuthorityInput): DefaultTaskRunti
 		terminalTaskIds: [],
 		latestTelemetry: null,
 		progressRecoveryWake: null,
+		specializations: [],
 	};
 	return { ...unsigned, stateDigest: stateDigest(unsigned) };
 }
@@ -584,6 +603,7 @@ function parseState(value: unknown, input: DefaultTaskRuntimeAuthorityInput): De
 	const state = value as DefaultTaskRuntimeState & {
 		readonly pendingCompletions?: unknown;
 		readonly progressRecoveryWake?: unknown;
+		readonly specializations?: unknown;
 	};
 	const pendingCompletions = state.pendingCompletions === undefined ? [] : state.pendingCompletions;
 	if (!Array.isArray(pendingCompletions) || pendingCompletions.some((pending) => !isPendingCompletion(pending)))
@@ -608,17 +628,22 @@ function parseState(value: unknown, input: DefaultTaskRuntimeAuthorityInput): De
 			))
 	)
 		throw new Error("default_prime_task_runtime_state_invalid");
+	const specializations = state.specializations === undefined ? [] : state.specializations;
+	if (!Array.isArray(specializations) || specializations.some((entry) => !isTaskSpecialization(entry)))
+		throw new Error("default_prime_task_runtime_state_invalid");
 	const {
 		stateDigest: persistedDigest,
 		pendingCompletions: _persistedPendingCompletions,
 		progressRecoveryWake: _persistedWake,
+		specializations: _persistedSpecializations,
 		...unsignedWithoutOptionalFields
 	} = state;
-	const unsigned = { ...unsignedWithoutOptionalFields, pendingCompletions, progressRecoveryWake };
+	const unsigned = { ...unsignedWithoutOptionalFields, pendingCompletions, progressRecoveryWake, specializations };
 	const legacyDigests = [
 		digestObject(unsignedWithoutOptionalFields),
 		digestObject({ ...unsignedWithoutOptionalFields, progressRecoveryWake }),
 		digestObject({ ...unsignedWithoutOptionalFields, pendingCompletions }),
+		digestObject({ ...unsignedWithoutOptionalFields, pendingCompletions, progressRecoveryWake }),
 	];
 	if (
 		state.version !== 1 ||
@@ -631,7 +656,62 @@ function parseState(value: unknown, input: DefaultTaskRuntimeAuthorityInput): De
 		(persistedDigest !== stateDigest(unsigned) && !legacyDigests.includes(persistedDigest))
 	)
 		throw new Error("default_prime_task_runtime_state_invalid");
-	return structuredClone({ ...state, pendingCompletions, progressRecoveryWake }) as DefaultTaskRuntimeState;
+	return structuredClone({
+		...state,
+		pendingCompletions,
+		progressRecoveryWake,
+		specializations,
+	}) as DefaultTaskRuntimeState;
+}
+
+function isTaskSpecialization(value: unknown): value is WorkflowTaskSpecializationProjection {
+	if (!isRecord(value)) return false;
+	const base = value.base;
+	const extension = value.extension;
+	return (
+		isRecord(base) &&
+		(base.kind === "native_methodology" || base.kind === "autoresearch") &&
+		typeof base.contractVersion === "string" &&
+		typeof base.phaseTag === "string" &&
+		(base.statusTag === undefined || typeof base.statusTag === "string") &&
+		typeof base.sourceJournalSequence === "number" &&
+		typeof base.sourceJournalDigest === "string" &&
+		isRecord(base.payloadRef) &&
+		isRecord(extension) &&
+		typeof extension.taskId === "string"
+	);
+}
+
+/**
+ * Which methodology one node is in, and why.
+ *
+ * Evaluated per node against the same state `launchReady` reads, so two nodes of one graph can hold
+ * different verdicts at the same moment: entry is a property of the node, not of the session. A node
+ * the recipe declares as an autoresearch stage is in autoresearch by contract; every other node has
+ * to earn it — the host must be able to measure at all, the node must own a contract that its
+ * terminal dependencies have frozen, and it must have a completed attempt to measure against.
+ *
+ * Args:
+ * state: Current runtime state; supplies terminal dependencies and prior attempt results.
+ * task: Graph node being judged.
+ * measurable: Whether the host has a metric command at all.
+ * contracted: Node ids the active recipe declares as autoresearch stages.
+ * Return: The node's methodology kind and the status tag explaining it.
+ */
+function autoresearchVerdict(
+	state: DefaultTaskRuntimeState,
+	task: WorkflowTask,
+	measurable: boolean,
+	contracted: readonly string[],
+): { kind: WorkflowSpecializationProjection["kind"]; statusTag: string } {
+	if (contracted.includes(task.taskId)) return { kind: "autoresearch", statusTag: "contract_declared" };
+	if (!measurable) return { kind: "native_methodology", statusTag: "metric_command_unconfigured" };
+	if (task.ownedContracts.length === 0) return { kind: "native_methodology", statusTag: "contract_unowned" };
+	if (!task.dependencyTaskIds.every((dependency) => state.terminalTaskIds.includes(dependency)))
+		return { kind: "native_methodology", statusTag: "contract_unfrozen" };
+	if (!state.launches.some((launch) => launch.taskId === task.taskId && launch.result !== null))
+		return { kind: "native_methodology", statusTag: "baseline_missing" };
+	return { kind: "autoresearch", statusTag: "ready" };
 }
 
 function classification(): WorkflowTaskRuntimeEvidenceClassification {
@@ -709,6 +789,8 @@ export function createDefaultTaskRuntimeAuthority(
 	let progressLeaseTimer: ReturnType<typeof setTimeout> | null = null;
 	let progressRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 	const taskLeaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	// Cached for the synchronous status projection the daemon list reads; refreshed on every pass.
+	let specializations: readonly WorkflowTaskSpecializationProjection[] = [];
 	let scheduleProgressLeaseDeadline: (lease: WorkflowProgressLease) => void = () => undefined;
 	let scheduleProgressRecoveryDeadline: (wake: DefaultTaskRuntimeProgressRecoveryWake) => void = () => undefined;
 	let scheduleTaskLeaseDeadline: (attemptId: string, expiresAt: string) => void = () => undefined;
@@ -3056,7 +3138,102 @@ export function createDefaultTaskRuntimeAuthority(
 		progressRecoveryTimer.unref?.();
 	};
 
+	/**
+	 * Publish one node's specialization payload and bind the projection to the journal head it was
+	 * derived from.
+	 *
+	 * Args:
+	 * taskId: Node the projection describes.
+	 * desired: Methodology kind, phase tag, and status tag the readiness predicate produced.
+	 * head: Journal head this projection is derived from.
+	 * Return: The durable specialization projection.
+	 */
+	const publishSpecialization = async (
+		taskId: string,
+		desired: { kind: WorkflowSpecializationProjection["kind"]; statusTag: string },
+		head: WorkflowJournalHead,
+	): Promise<WorkflowSpecializationProjection> => {
+		// The journal position belongs in the payload, not only in the projection around it: the artifact
+		// store is content-addressed, so identical bytes published against two different sequences would
+		// otherwise collide on one path carrying two different envelopes.
+		const bytes = canonicalJsonBytes({
+			schemaVersion: 1,
+			kind: "default_prime_task_specialization",
+			workflowId: input.workflowId,
+			taskId,
+			specializationKind: desired.kind,
+			phaseTag: SPECIALIZATION_PHASE_TAGS[desired.kind],
+			statusTag: desired.statusTag,
+			sourceJournalSequence: head.sequence,
+			sourceJournalDigest: head.eventDigest ?? "",
+		});
+		const published = await input.runtimeStore.publishArtifact({
+			workflowId: input.workflowId,
+			payloadKind: "evidence",
+			bytes,
+			codec: "canonical_json",
+			sourceEventSequence: head.sequence,
+			// Epoch-scoped: an artifact idempotency record is authenticated with an epoch-scoped secret, so
+			// a key that outlives a coordinator rotation fails to decode on the next resume.
+			idempotencyKey: `default-prime-task-specialization:${digestObject({
+				workflowId: input.workflowId,
+				epochRef: input.epochRef,
+				taskId,
+				bytesDigest: sha256Hex(bytes),
+			})}`,
+		});
+		return {
+			kind: desired.kind,
+			contractVersion: SPECIALIZATION_CONTRACT_VERSION,
+			phaseTag: SPECIALIZATION_PHASE_TAGS[desired.kind],
+			statusTag: desired.statusTag,
+			sourceJournalSequence: head.sequence,
+			sourceJournalDigest: head.eventDigest ?? "",
+			payloadRef: published.envelope.ref,
+		};
+	};
+
+	/**
+	 * Re-derive every node's methodology from current state.
+	 *
+	 * Runs wherever ready tasks are evaluated, so a node crosses into autoresearch the moment its own
+	 * preconditions hold and falls back the moment they stop. A node whose verdict has not moved keeps
+	 * its existing projection, so a standing graph does not republish on every pass.
+	 */
+	const refreshSpecializations = async (): Promise<void> => {
+		const measurable = input.autoresearchMeasurable?.() ?? false;
+		const contracted = input.autoresearchContractedTaskIds ?? [];
+		const replay = await input.runtimeStore.replay({
+			workflowId: input.workflowId,
+			fromSequence: 0,
+			expectedStoreEpoch: input.epochRef.storeEpoch,
+		});
+		if (replay.quarantined || replay.head.eventDigest === null)
+			throw new Error("default_prime_task_runtime_w0_authority_missing");
+		specializations = await mutate(async (state) => {
+			const prior = new Map(state.specializations.map((entry) => [entry.extension.taskId, entry]));
+			let changed = prior.size !== input.graph.tasks.length;
+			const next: WorkflowTaskSpecializationProjection[] = [];
+			for (const task of input.graph.tasks) {
+				const desired = autoresearchVerdict(state, task, measurable, contracted);
+				const existing = prior.get(task.taskId);
+				if (existing?.base.kind === desired.kind && existing.base.statusTag === desired.statusTag) {
+					next.push(existing);
+					continue;
+				}
+				changed = true;
+				next.push({
+					base: await publishSpecialization(task.taskId, desired, replay.head),
+					extension: { taskId: task.taskId },
+				});
+			}
+			if (!changed) return [state, state.specializations];
+			return [evolveState(state, { specializations: next }), next];
+		});
+	};
+
 	async function launchReady(): Promise<void> {
+		await refreshSpecializations();
 		if (input.workerLauncher === undefined) return;
 		if (input.graph.generatedOutputPaths.length > 0 && input.createTaskCapsule === undefined)
 			throw new Error("default_prime_task_contract_unsatisfiable");
@@ -3156,7 +3333,11 @@ export function createDefaultTaskRuntimeAuthority(
 				executionKey: request.executionKey,
 				epochRef: input.epochRef,
 				deadlineAt: resourceLease.expiresAt,
-				prompt: taskCapsule === null ? request.task.objective : taskCapsulePrompt(taskCapsule),
+				// The direction rides the prompt itself: a skill listed anywhere the worker cannot see
+				// directs nothing.
+				prompt:
+					(taskCapsule === null ? request.task.objective : taskCapsulePrompt(taskCapsule)) +
+					workflowSkillPromptLines(request.task.skills),
 				taskCapsule: taskCapsule ?? undefined,
 				sessionName: `prime-${request.task.taskId}`,
 				...(request.task.computeClass === undefined ? {} : { computeClass: request.task.computeClass }),
@@ -3514,6 +3695,7 @@ export function createDefaultTaskRuntimeAuthority(
 			});
 			await launchReady();
 		},
+		specializations: () => specializations,
 		readState: readSchedulerState,
 		readAudit: async () => {
 			const state = await readState();

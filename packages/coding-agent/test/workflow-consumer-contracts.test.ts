@@ -92,6 +92,7 @@ import type {
 	WorkflowSpecializationProjection,
 	WorkflowStoreCommitInput,
 	WorkflowStoreCommitResult,
+	WorkflowTaskSpecializationProjection,
 	WorkflowVerifiedHostReceipt,
 	WorkflowZeroControlCapacityVector,
 } from "../src/core/workflow/contracts.js";
@@ -796,6 +797,11 @@ const specialization: WorkflowSpecializationProjection = {
 		sourceEventSequence: 1,
 	},
 };
+const taskSpecialization: WorkflowTaskSpecializationProjection = {
+	base: specialization,
+	extension: { taskId: "probe" },
+};
+void taskSpecialization;
 void childIdentity;
 void cloudResponse;
 void specialization;

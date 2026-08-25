@@ -1095,6 +1095,99 @@ const WORKFLOW_ROLE_COMPUTE_FLOOR: Readonly<Partial<Record<WorkflowTaskRole, Wor
 	});
 
 /**
+ * Skills every task of a role gets whether or not the plan asked for them.
+ *
+ * A role's failure modes are the same every run, so the correction belongs on the role rather than in
+ * a message sent after the fact. Ceremony is the dominant one: roles that build or attack things
+ * elaborate specifications, perfect output envelopes, and register paperwork instead of producing the
+ * artifact, so they carry "ponytail". Roles that decide whether something is finished carry
+ * "verification-before-completion", because the failure there is declaring success without evidence.
+ *
+ * This map only ever ADDS. A plan may name more skills; it can never drop a role's defaults, which is
+ * what makes the guidance internal rather than advisory.
+ */
+const WORKFLOW_ROLE_DEFAULT_SKILLS: Readonly<Partial<Record<WorkflowTaskRole, readonly string[]>>> = Object.freeze({
+	"red-team": Object.freeze(["ponytail", "systematic-debugging"]),
+	attack: Object.freeze(["ponytail", "systematic-debugging"]),
+	implementation: Object.freeze(["ponytail", "test-driven-development"]),
+	integration: Object.freeze(["ponytail", "test-driven-development"]),
+	"edge-test": Object.freeze(["test-driven-development", "verification-before-completion"]),
+	verify: Object.freeze(["verification-before-completion"]),
+	verification: Object.freeze(["verification-before-completion"]),
+	judge: Object.freeze(["verification-before-completion"]),
+	unify: Object.freeze(["verification-before-completion"]),
+	planning: Object.freeze(["writing-plans"]),
+	design: Object.freeze(["brainstorming", "writing-plans"]),
+	architect: Object.freeze(["brainstorming"]),
+	recon: Object.freeze(["systematic-debugging"]),
+	review: Object.freeze(["verification-before-completion"]),
+});
+
+/**
+ * What each skill directs a worker to do, in one or two sentences the worker actually reads.
+ *
+ * A skill name in a list directs nothing. The worker sees a prompt, so the essence has to be in the
+ * prompt - and the essence is intent, not procedure. The two lines this program has had to send as
+ * corrections most often are here verbatim: tests state intent rather than restating implementation,
+ * and the artifact beats ceremony.
+ */
+const WORKFLOW_SKILL_DIRECTIVES: Readonly<Record<string, string>> = Object.freeze({
+	"test-driven-development":
+		"Write the failing test that states the INTENT - the behavior needed - before any implementation. " +
+		"Never restate the implementation as assertions: a test that mirrors the code is the same thing " +
+		"written twice and proves nothing. If the implementation changes and the intent does not, a good test stays green.",
+	ponytail:
+		"Deliver the smallest thing that satisfies the intent. Specifications, output envelopes, and " +
+		"registration paperwork are not the artifact; if 200 lines could be 50, write 50, and if a step " +
+		"exists only to look rigorous, drop it.",
+	"systematic-debugging":
+		"Reproduce the failure before fixing anything, then fix the root cause where all callers route " +
+		"through - not the symptom the report names.",
+	"verification-before-completion":
+		"Do not declare success without evidence produced by actually running the thing. Planning is not " +
+		"evidence, and a check you did not run is a claim.",
+	brainstorming:
+		"Explore the decision space before committing: name the readings of the problem and what each would change.",
+	"writing-plans":
+		"State success criteria and the checks that prove them before work starts; a plan without its check is a hope.",
+});
+
+/**
+ * Render the prompt lines that put a task's skills in front of its worker.
+ *
+ * Args:
+ * skills: Skill names the task carries, or undefined when it carries none.
+ * Return: Prompt lines directing the worker, or an empty string when there is nothing to direct.
+ */
+export function workflowSkillPromptLines(skills: readonly string[] | undefined): string {
+	if (skills === undefined || skills.length === 0) return "";
+	const lines = skills.map((skill) => {
+		const directive = WORKFLOW_SKILL_DIRECTIVES[skill];
+		return directive === undefined ? `- ${skill}` : `- ${skill}: ${directive}`;
+	});
+	return `\n\nSkills in force for this task:\n${lines.join("\n")}`;
+}
+
+/**
+ * Union a task's declared skills with the defaults its role always carries.
+ *
+ * Args:
+ * role: Task role from the plan, or undefined when the plan named none.
+ * declared: Skills the plan asked for, or undefined when it named none.
+ * Return: Declared skills first in their original order, then role defaults not already present.
+ */
+export function workflowSkillsForRole(
+	role: WorkflowTaskRole | undefined,
+	declared: readonly string[] | undefined,
+): readonly string[] {
+	const defaults = role === undefined ? undefined : WORKFLOW_ROLE_DEFAULT_SKILLS[role];
+	if (defaults === undefined) return declared ?? [];
+	const merged = [...(declared ?? [])];
+	for (const skill of defaults) if (!merged.includes(skill)) merged.push(skill);
+	return Object.freeze(merged);
+}
+
+/**
  * Raise a declared compute class to its role's floor.
  *
  * Args:

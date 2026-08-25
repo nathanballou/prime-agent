@@ -3,6 +3,7 @@ import type {
 	WorkflowEpochRef,
 	WorkflowJournalHead,
 	WorkflowTask,
+	WorkflowTaskSpecializationProjection,
 	WorkflowVerifiedHostReceipt,
 } from "./contracts.js";
 import { digestObject } from "./contracts.js";
@@ -290,6 +291,7 @@ export interface DefaultPrimeTaskRuntime {
 	}): Promise<void>;
 	readStatus(): Promise<WorkflowTaskRuntimeStatus>;
 	read(): Promise<Awaited<ReturnType<WorkflowTaskRuntimeAuthority["readState"]>>>;
+	specializations(): readonly WorkflowTaskSpecializationProjection[];
 	readAudit(): Promise<WorkflowTaskRuntimeAudit>;
 }
 
@@ -317,6 +319,7 @@ export function createDefaultPrimeTaskRuntime(input: {
 		acceptStage: authority.acceptStage,
 		readStatus: authority.readStatus,
 		read: authority.readState,
+		specializations: () => authority.specializations?.() ?? [],
 		readAudit: authority.readAudit,
 	});
 }

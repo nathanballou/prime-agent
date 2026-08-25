@@ -10118,6 +10118,58 @@ describe("daemon mode helpers", () => {
 			}),
 		).rejects.toThrow("Unknown active session: missing");
 	});
+
+	it("resumes a saved session in the cwd the caller asked for", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-resume-cwd-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const savedCwd = join(tempDir, "saved-project");
+			const requestedCwd = join(tempDir, "requested-project");
+			mkdirSync(savedCwd, { recursive: true });
+			mkdirSync(requestedCwd, { recursive: true });
+			const manager = SessionManager.create(savedCwd, sessionDir);
+			manager.appendSessionInfo("saved");
+			const sessionPath = manager.getSessionFile();
+			if (!sessionPath) throw new Error("Missing saved session file");
+			const { daemon, createRuntime } = makeCwdDaemon(tempDir, sessionDir);
+
+			const state = await (
+				daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				}
+			).createRuntime({ type: "create", sessionPath, config: { cwd: requestedCwd, agentDir: tempDir } });
+
+			expect(createRuntime.mock.calls[0]?.[0]?.cwd).toBe(requestedCwd);
+			expect(state.runtime.cwd).toBe(requestedCwd);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resumes a saved session in its recorded cwd when the caller asks for none", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-recorded-cwd-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const savedCwd = join(tempDir, "saved-project");
+			mkdirSync(savedCwd, { recursive: true });
+			const manager = SessionManager.create(savedCwd, sessionDir);
+			manager.appendSessionInfo("saved");
+			const sessionPath = manager.getSessionFile();
+			if (!sessionPath) throw new Error("Missing saved session file");
+			const { daemon, createRuntime } = makeCwdDaemon(tempDir, sessionDir);
+
+			const state = await (
+				daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				}
+			).createRuntime({ type: "create", sessionPath });
+
+			expect(createRuntime.mock.calls[0]?.[0]?.cwd).toBe(savedCwd);
+			expect(state.runtime.cwd).toBe(savedCwd);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 });
 
 type CronAdmissionActivity = Partial<{
@@ -10382,6 +10434,27 @@ function makePersistedRlmDaemonFixture(
 		grandchildId,
 		grandchildSessionFile,
 	};
+}
+
+function makeCwdDaemon(
+	tempDir: string,
+	sessionDir: string,
+): { daemon: AgentDaemon; createRuntime: ReturnType<typeof vi.fn> } {
+	const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+		session: makeRuntimeSession(options.sessionManager),
+		extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+			ReturnType<CreateAgentSessionRuntimeFactory>
+		>["extensionsResult"],
+		services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+			ReturnType<CreateAgentSessionRuntimeFactory>
+		>["services"],
+		diagnostics: [],
+	}));
+	const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+		defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+		createRuntime,
+	});
+	return { daemon, createRuntime };
 }
 
 function makeRuntimeSession(

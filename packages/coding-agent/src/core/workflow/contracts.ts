@@ -1497,6 +1497,8 @@ export interface WorkflowTask {
 	ownedPaths: readonly string[];
 	ownedContracts: readonly string[];
 	requiredSkillSnapshotDigests: readonly string[];
+	/** Skills this task's worker is directed by; the role's defaults are unioned in at normalization. */
+	skills?: readonly string[];
 	verificationCommandDigests: readonly string[];
 	authority: readonly WorkflowAuthorityCapability[];
 	declaredResourceVector: WorkflowResourceVector;
@@ -2226,6 +2228,11 @@ export interface WorkflowSpecializationProjectionWrapper<TPayload> {
 	base: WorkflowSpecializationProjection;
 	extension: TPayload;
 }
+
+/** Specialization projection bound to the DAG node whose methodology it reports. */
+export type WorkflowTaskSpecializationProjection = WorkflowSpecializationProjectionWrapper<{
+	readonly taskId: string;
+}>;
 
 export type ResourceVector = WorkflowResourceVector;
 export type ResourceLeaseRef = Pick<

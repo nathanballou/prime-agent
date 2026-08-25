@@ -570,6 +570,12 @@ export interface DefaultPrimeWorkflowProviderInput {
 	readonly workspacePaths?: readonly string[];
 	/** Command the host runs to measure a candidate; absent keeps the measurement refusing. */
 	readonly metricCommand?: { readonly command: string; readonly args: readonly string[]; readonly timeoutMs: number };
+	/**
+	 * Directory the measured repository lives in — the session's cwd, not the worker process's.
+	 * Required rather than optional: a resumed session runs in its own recorded directory while the
+	 * worker process stays in the daemon's, so defaulting here would silently measure the wrong repo.
+	 */
+	readonly sessionCwd: string;
 	readonly resourceLoader?: WorkflowResourceLoaderPort;
 	readonly readStatus: () => WorkflowShellStatus;
 	readonly executionEvidence: WorkflowExecutionEvidenceRuntime;
@@ -1016,6 +1022,11 @@ async function composeDefaultPrimeWorkflow(
 						withHostLeaseOperation: input.withHostLeaseOperation,
 						readWorkflowStatus: input.readStatus,
 						beforeTaskLaunch: input.beforeTaskLaunch,
+						autoresearchMeasurable: () => input.metricCommand !== undefined,
+						// The built-in adaptive recipe accepts only autoresearch evidence for its recon stage
+						// (see recordPipelineStageInternal), so that node's methodology is declared, not discovered.
+						autoresearchContractedTaskIds:
+							snapshots.recipe.recipeId === BUILTIN_DEFAULT_PRIME_ADAPTIVE_RECIPE.recipeId ? ["recon"] : [],
 						prime: taskRuntimePrimeAdapter,
 					})
 				: await input.taskRuntimeAuthorityFactory({
@@ -1373,6 +1384,7 @@ async function composeDefaultPrimeWorkflow(
 		adapters,
 		taskGraph,
 		readSchedulerState: taskRuntime.read,
+		taskSpecializations: () => taskRuntime.specializations(),
 		epochRef: input.epochRef,
 		executeSkillIteration,
 		recordSkillOutcome: async (skillName, result) => {
@@ -2185,9 +2197,12 @@ export async function createDefaultAutoResearchParts(
 			if (metricCommand !== undefined) {
 				const startedAt = Date.now();
 				const executed = await execFileAsync(metricCommand.command, [...metricCommand.args], {
-					// The provider runs in the session process, whose cwd is the repository root — the same
-					// root the scope and immutable-path checks ask git about.
-					cwd: process.cwd(),
+					// The session's cwd, which is the root the scope and immutable-path checks ask git about
+					// (_reportScopeViolations reads sessionManager.getCwd()). Not process.cwd(): a resumed
+					// session takes its directory from its own recorded header while the worker process stays
+					// where the daemon was started, so the two disagree and process.cwd() can point at an
+					// entirely different repository than the one being scored.
+					cwd: input.sessionCwd,
 					timeout: metricCommand.timeoutMs,
 					maxBuffer: 8 * 1024 * 1024,
 				}).then(
@@ -3232,6 +3247,7 @@ function defaultTasks(input: {
 		boundaryIds: [...task.boundaryIds],
 		outputRefs: [...task.outputRefs],
 		...(task.computeClass === undefined ? {} : { computeClass: task.computeClass }),
+		...(task.skills === undefined ? {} : { skills: [...task.skills] }),
 		evidencePolicy: { ...task.evidencePolicy },
 		evidenceKind: task.evidencePolicy.kind,
 		budget: { ...task.budget },

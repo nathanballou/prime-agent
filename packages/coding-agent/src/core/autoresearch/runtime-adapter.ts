@@ -748,12 +748,18 @@ export function createAutoResearchRunHostHandler(
 		deepFreeze(requestPayload);
 		if (
 			Object.keys(requestPayload).some(
-				(key) => !["cellSourceCode", "evidence_refs", "recipe_digest", "type"].includes(key),
+				(key) => !["cellSourceCode", "evidence_refs", "recipe_digest", "task_id", "type"].includes(key),
 			)
 		)
 			fail("handler_payload_invalid");
 		if (requestPayload.cellSourceCode !== undefined && typeof requestPayload.cellSourceCode !== "string")
 			fail("handler_payload_invalid");
+		// Names the node the run acts for. Optional: a single qualifying node still infers, and the
+		// entry gate rejects before this adapter is reached when the named node has not entered.
+		if (requestPayload.task_id !== undefined) {
+			if (typeof requestPayload.task_id !== "string") fail("handler_payload_invalid");
+			assertUtf8Text(requestPayload.task_id, 128, "handler_task_id");
+		}
 		if (typeof requestPayload.recipe_digest !== "string") fail("handler_recipe_digest_invalid");
 		assertUtf8Text(requestPayload.recipe_digest, 64, "handler_recipe_digest");
 		assertDigest(requestPayload.recipe_digest, "handler_recipe_digest");

@@ -1,0 +1,1 @@
+- Fixed the autoresearch metric command running in the daemon's directory instead of the session's, so a resumed session no longer scores a different repository than the one it is editing.

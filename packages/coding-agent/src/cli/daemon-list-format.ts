@@ -127,7 +127,11 @@ function formatWorkflowStatus(status: DaemonWorkflowStatusProjection | undefined
 	if (!status) {
 		return "";
 	}
-	return status.phase ? `${status.status}/${status.phase}` : status.status;
+	const phase = status.phase ? `${status.status}/${status.phase}` : status.status;
+	// A node in autoresearch is invisible in a status/phase pair, which is exactly why the column read
+	// as empty before: entry is per node, and the session-level phase never names it.
+	const entered = (status.specializations ?? []).filter((entry) => entry.kind === "autoresearch").length;
+	return entered === 0 ? phase : `${phase}+autoresearch:${entered}`;
 }
 
 function formatWorkflowNext(status: DaemonWorkflowStatusProjection | undefined): string {

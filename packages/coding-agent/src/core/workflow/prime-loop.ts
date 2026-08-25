@@ -25,6 +25,7 @@ import {
 	type KnowledgeProposal,
 } from "../knowledge/records.js";
 import type { PrimeAdaptiveRuntime } from "./adaptive-runtime.js";
+import { resolveAutoresearchTask } from "./autoresearch-entry.js";
 import { resolveWorkflowRuntimeConfig } from "./config.js";
 import type {
 	WorkflowArtifactRef,
@@ -36,6 +37,7 @@ import type {
 	WorkflowRuntimeConfigSnapshot,
 	WorkflowRuntimeStore,
 	WorkflowStoreReplayResult,
+	WorkflowTaskSpecializationProjection,
 	WorkflowTrustedPrincipal,
 	WorkflowVerifiedHostReceipt,
 } from "./contracts.js";
@@ -160,6 +162,7 @@ export interface ProductionPrimeWorkflowInput {
 	readonly adapters: PrimeWorkflowAuthenticatedAdapters;
 	readonly taskGraph?: WorkflowTaskGraph;
 	readonly readSchedulerState?: () => Promise<WorkflowSchedulerState>;
+	readonly taskSpecializations?: () => readonly WorkflowTaskSpecializationProjection[];
 	/** Host-owned fresh invocation seam; callers never provide token material. */
 	readonly executeSkillIteration?: <TResult>(input: {
 		readonly skillName: string;
@@ -180,6 +183,8 @@ export interface ProductionPrimeWorkflow {
 	readonly snapshots: PrimeWorkflowSnapshots;
 	readonly taskGraph?: WorkflowTaskGraph;
 	readonly readSchedulerState?: () => Promise<WorkflowSchedulerState>;
+	/** Per-node methodology as of the last ready-task evaluation; drives the autoresearch entry gate. */
+	readonly taskSpecializations?: () => readonly WorkflowTaskSpecializationProjection[];
 	/** Current host-authenticated recipe and evidence rules injected into every durable planner continuation. */
 	readonly plannerDirective: string;
 	readonly initializationOrder: readonly PrimeWorkflowInitializationStep[];
@@ -1643,15 +1648,41 @@ export async function createProductionPrimeWorkflow(
 				};
 			}
 		: undefined;
+	/**
+	 * Refuse an autoresearch run unless the node it names has entered autoresearch.
+	 *
+	 * Args:
+	 * input: Loop input exposing the current per-node specialization projections.
+	 * handler: Adapter that performs the run once entry is admitted.
+	 * Return: The handler wrapped in the entry check.
+	 */
+	function autoresearchEntryGuard(
+		input: { readonly taskSpecializations?: () => readonly WorkflowTaskSpecializationProjection[] },
+		handler: HostRequestHandler,
+	): HostRequestHandler {
+		return async (payload, context) => {
+			const requested =
+				typeof payload.task_id === "string" && payload.task_id.length > 0 ? payload.task_id : undefined;
+			resolveAutoresearchTask(input.taskSpecializations?.() ?? [], requested);
+			return handler(payload, context);
+		};
+	}
+
 	const hostRequestHandlers: HostRequestHandlers = Object.freeze({
-		"workflow.v1.autoresearch.run": guardedHandler(input.adapters.autoResearchHandler, {
-			runtimeStore: input.runtimeStore,
-			requestType: "workflow.v1.autoresearch.run",
-			workflowId: input.workflowId,
-			readStatus: input.readStatus,
-			now,
-			isIssuedNonce,
-		}),
+		// Gated here rather than only at the skill call site: agent-session injects this map straight
+		// into the kernel, which builds its own gateway over it and aliases "autoresearch.run", so a
+		// cell reaching the adapter never passes through executeWorkflowHostRequest.
+		"workflow.v1.autoresearch.run": guardedHandler(
+			autoresearchEntryGuard(input, input.adapters.autoResearchHandler),
+			{
+				runtimeStore: input.runtimeStore,
+				requestType: "workflow.v1.autoresearch.run",
+				workflowId: input.workflowId,
+				readStatus: input.readStatus,
+				now,
+				isIssuedNonce,
+			},
+		),
 		"workflow.v1.mempalace.recall": readGuardedHandler(input.adapters.mempalaceRecallHandler, {
 			requestType: "workflow.v1.mempalace.recall",
 			workflowId: input.workflowId,
@@ -1736,6 +1767,7 @@ export async function createProductionPrimeWorkflow(
 		snapshots,
 		...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
 		...(input.readSchedulerState === undefined ? {} : { readSchedulerState: input.readSchedulerState }),
+		...(input.taskSpecializations === undefined ? {} : { taskSpecializations: input.taskSpecializations }),
 		get plannerDirective(): string {
 			return primePlannerDirective(
 				snapshots,

@@ -331,6 +331,7 @@ import {
 	trackedUnder,
 	worktreesWithChanges,
 } from "./workflow/agent-collaboration.js";
+import { resolveAutoresearchTask } from "./workflow/autoresearch-entry.js";
 import {
 	createWorkflowBrainstormState,
 	createWorkflowProposalTool,
@@ -344,6 +345,7 @@ import {
 	workflowStartRequestFromProposal,
 } from "./workflow/brainstorm.js";
 import { readWorkflowCliApprovalDelivery, removeWorkflowCliApprovalDelivery } from "./workflow/cli-approval.js";
+import type { WorkflowTaskSpecializationProjection } from "./workflow/contracts.js";
 import { digestObject, sha256Hex } from "./workflow/contracts.js";
 import type { DefaultPrimeWorkerFailureNotice } from "./workflow/default-task-runtime.js";
 import type {
@@ -1167,7 +1169,7 @@ type GoalSlashCommand =
 
 type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
 
-interface WorkflowKernelHostBindings {
+export interface WorkflowKernelHostBindings {
 	readonly hostRequestHandlers?: HostRequestHandlers;
 	readonly resolveHostRequestCapability?: (requestType: string) => HostRequestCapabilityContext;
 	readonly admitWorkerModel?: WorkerModelCapabilityLaunchAuthorizer;
@@ -1180,6 +1182,7 @@ interface WorkflowKernelHostBindings {
 		};
 		readonly taskGraph?: { readonly graphDigest: string };
 		readonly readSchedulerState?: () => Promise<WorkflowSchedulerState>;
+		readonly taskSpecializations?: () => readonly WorkflowTaskSpecializationProjection[];
 		readonly executeSkill?: <TResult>(input: {
 			readonly snapshotDigest: string;
 			readonly token: string | Readonly<Uint8Array>;
@@ -1205,6 +1208,23 @@ interface WorkflowKernelHostBindings {
 		readonly adaptiveRuntime?: { read(): Promise<PrimeAdaptiveRuntimeState> };
 		readonly recordSkillOutcome?: (skillName: string, result: Record<string, unknown>) => Promise<void>;
 	};
+}
+
+/**
+ * Refuse an autoresearch iteration on a workflow where no node has entered autoresearch.
+ *
+ * Entry is per-node workflow state, not a model choice: the skill may run only while some node's own
+ * readiness predicate holds. The refusal names each node's blocker so the operator can act on it.
+ *
+ * Args:
+ * workflowHost: Bound workflow host exposing the Prime task specializations.
+ * Return: Nothing; throws when no node is in autoresearch.
+ */
+export function assertWorkflowAutoresearchEntered(
+	workflowHost: WorkflowKernelHostBindings,
+	requestedTaskId?: string,
+): string {
+	return resolveAutoresearchTask(workflowHost.primeWorkflow?.taskSpecializations?.() ?? [], requestedTaskId);
 }
 
 interface WorkflowKernelOwnership {
@@ -2199,6 +2219,9 @@ export class AgentSession {
 	getWorkflowStatusProjection(): DaemonWorkflowStatusProjection | undefined {
 		const status = this._workflowHost?.status();
 		if (status === undefined) return undefined;
+		const specializations = (
+			this._workflowHost as WorkflowKernelHostBindings | undefined
+		)?.primeWorkflow?.taskSpecializations?.();
 		const blocked = status.blocked;
 		const approvalRequest = status.approvalRequest;
 		return {
@@ -2239,6 +2262,16 @@ export class AgentSession {
 								effectDigest,
 							})),
 						},
+			...(specializations === undefined
+				? {}
+				: {
+						specializations: specializations.map((entry) => ({
+							taskId: entry.extension.taskId,
+							kind: entry.base.kind,
+							phaseTag: entry.base.phaseTag,
+							...(entry.base.statusTag === undefined ? {} : { statusTag: entry.base.statusTag }),
+						})),
+					}),
 		};
 	}
 
@@ -2466,6 +2499,8 @@ export class AgentSession {
 						return this.executeWorkflowHostRequest("workflow.v1.autoresearch.run", {
 							recipe_digest: workflowHost.primeWorkflow?.snapshots?.recipe.recipeDigest,
 							evidence_refs: [],
+							// Name the node so the run is scoped to the stage that actually qualified.
+							task_id: resolveAutoresearchTask(workflowHost.primeWorkflow?.taskSpecializations?.() ?? []),
 						});
 					}
 					if (input.skillName === "mempalace") {
@@ -2683,6 +2718,8 @@ export class AgentSession {
 		const handlers = this._workflowHostRequestHandlers;
 		if (handlers === undefined) throw new Error("Workflow kernel host handlers are unavailable.");
 		const bindings = workflowShell as WorkflowKernelHostBindings;
+		// Guarded here rather than at the skill, because the kernel reaches the same request directly.
+		if (requestType === "workflow.v1.autoresearch.run") assertWorkflowAutoresearchEntered(bindings);
 		const response = await createHostRequestGateway({
 			handlers,
 			capabilityResolver: (type) =>

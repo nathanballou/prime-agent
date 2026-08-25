@@ -10,6 +10,7 @@ import type {
 	WorkflowRuntimeStore,
 	WorkflowStoreCommitInput,
 	WorkflowStoreCommitResult,
+	WorkflowTaskSpecializationProjection,
 } from "../../src/core/workflow/contracts.js";
 import {
 	canonicalJsonBytes,
@@ -1169,9 +1170,12 @@ it("holds a dependency launch behind the host message-delivery barrier", async (
 	finishRecon({ status: "completed", output: "recon result", error: null, retryable: false });
 	await vi.waitFor(() => expect(beforeTaskLaunch).toHaveBeenCalledWith("verify"));
 	expect(launchWorker).toHaveBeenCalledTimes(1);
-	expect([...fixture.auxiliary.values()].map((bytes) => new TextDecoder().decode(bytes)).join("\n")).not.toContain(
-		'"taskId":"verify"',
-	);
+	const persistedLaunches = (
+		parseCanonicalJsonBytes(fixture.auxiliary.get("default-prime-task-runtime-v1.json")!) as unknown as {
+			readonly launches: readonly { readonly taskId: string }[];
+		}
+	).launches;
+	expect(persistedLaunches.map((launch) => launch.taskId)).not.toContain("verify");
 	releaseBarrier();
 	await vi.waitFor(() => expect(launchWorker).toHaveBeenCalledTimes(2));
 });
@@ -2844,4 +2848,237 @@ it("fans out only as wide as the dependency graph actually allows", async () => 
 	await authority.start();
 
 	expect(launchWorker).toHaveBeenCalledTimes(1);
+});
+
+function siblingSpecializationGraph(): WorkflowTaskGraph {
+	// probe owns a contract; sketch owns none, so the two siblings can never share a readiness verdict.
+	const probe = { ...task("probe"), ownedContracts: ["contract:probe"] };
+	const sketch = task("sketch");
+	const tasks = [probe, sketch];
+	return {
+		graphRevision: 1,
+		tasks,
+		byId: new Map(tasks.map((stage) => [stage.taskId, stage])),
+		allowedAuthority: ["read_workspace"],
+		ownershipPaths: [],
+		generatedOutputPaths: [],
+		lockPaths: [],
+		namedContracts: [],
+		graphDigest: digestObject(tasks),
+	};
+}
+
+function completingLauncher(): TestWorkerLauncher {
+	return async (request) => ({
+		workerId: `worker:${request.taskId}`,
+		executionIdentity: `rlm:worker:${request.taskId}:${request.executionKey}`,
+		processStartId: `host:123:${request.taskId}`,
+		processGroupId: `same-process-rlm:123:${request.taskId}`,
+		launchedAt: NOW,
+		completion: Promise.resolve({
+			status: "completed" as const,
+			output: "authenticated worker result",
+			error: null,
+			retryable: false,
+		}),
+	});
+}
+
+async function runSpecializationFixture(
+	fixture: ReturnType<typeof runtimeStoreFixture>,
+	autoresearchMeasurable: () => boolean,
+) {
+	const taskGraph = siblingSpecializationGraph();
+	const authority = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: taskGraph,
+		maxWorkers: 2,
+		now: () => NOW,
+		workerLauncher: completingLauncher(),
+		autoresearchMeasurable,
+		prime: primeAdapter(),
+	});
+	await authority.start();
+	await vi.waitFor(async () => {
+		await expect(authority.readAudit()).resolves.toMatchObject({
+			workerResults: [
+				expect.objectContaining({ status: "completed" }),
+				expect.objectContaining({ status: "completed" }),
+			],
+		});
+	});
+	const classification = await authority.prime.recordEvidence({
+		stageId: "probe",
+		evidenceRefs: [
+			{
+				artifactId: "stage-evidence",
+				relativePath: "evidence/stage",
+				digest: "stage-evidence-digest",
+				sizeBytes: 1,
+				sourceEventSequence: 1,
+			},
+		],
+	});
+	await authority.acceptStage({ stageId: "probe", classification });
+	return authority;
+}
+
+function specializationFor(
+	authority: { specializations?: () => readonly WorkflowTaskSpecializationProjection[] },
+	taskId: string,
+): WorkflowTaskSpecializationProjection | undefined {
+	return (authority.specializations?.() ?? []).find((entry) => entry.extension.taskId === taskId);
+}
+
+it("puts a task's skills in front of the worker, stated as intent", async () => {
+	// The intent under test: a worker launched for a skilled task is DIRECTED by those skills in the
+	// prompt it actually receives. Where the list is stored, how it is merged, and which resolver
+	// computed it are implementation - a worker that never sees the direction proves none of it.
+	const fixture = runtimeStoreFixture();
+	const skilled = {
+		...task("skilled"),
+		skills: ["test-driven-development", "ponytail"],
+	} as WorkflowTask;
+	const tasks = [skilled];
+	const prompts: string[] = [];
+	const launcher: TestWorkerLauncher = async (request) => {
+		prompts.push(request.prompt);
+		return completingLauncher()(request);
+	};
+	const authority = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: {
+			graphRevision: 1,
+			tasks,
+			byId: new Map(tasks.map((stage) => [stage.taskId, stage])),
+			allowedAuthority: ["read_workspace"],
+			ownershipPaths: [],
+			generatedOutputPaths: [],
+			lockPaths: [],
+			namedContracts: [],
+			graphDigest: digestObject(tasks),
+		},
+		maxWorkers: 1,
+		now: () => NOW,
+		workerLauncher: launcher,
+		autoresearchMeasurable: () => false,
+		prime: primeAdapter(),
+	});
+	await authority.start();
+	await vi.waitFor(() => {
+		expect(prompts).toHaveLength(1);
+	});
+	// The two defaults this program keeps correcting by message: tests must state intent rather than
+	// restate implementation, and the artifact beats ceremony.
+	expect(prompts[0]).toMatch(/intent/i);
+	expect(prompts[0]).toMatch(/written twice|mirrors the (code|implementation)/i);
+	expect(prompts[0]).toContain("ponytail");
+});
+
+it("holds a different specialization kind on each sibling node at the same time", async () => {
+	const fixture = runtimeStoreFixture();
+	const authority = await runSpecializationFixture(fixture, () => true);
+
+	expect(specializationFor(authority, "probe")?.base).toMatchObject({
+		kind: "autoresearch",
+		phaseTag: "experiment",
+		statusTag: "ready",
+	});
+	expect(specializationFor(authority, "sketch")?.base).toMatchObject({
+		kind: "native_methodology",
+		phaseTag: "task_execution",
+		statusTag: "contract_unowned",
+	});
+});
+
+it("keeps every node in native methodology while the host has no metric command", async () => {
+	const fixture = runtimeStoreFixture();
+	const authority = await runSpecializationFixture(fixture, () => false);
+
+	expect(specializationFor(authority, "probe")?.base).toMatchObject({
+		kind: "native_methodology",
+		statusTag: "metric_command_unconfigured",
+	});
+	expect(specializationFor(authority, "sketch")?.base.kind).toBe("native_methodology");
+});
+
+it("publishes each specialization payload and reads it back after a reopen", async () => {
+	const fixture = runtimeStoreFixture();
+	const authority = await runSpecializationFixture(fixture, () => true);
+	const probe = specializationFor(authority, "probe");
+	if (probe === undefined) throw new Error("fast_fixture_specialization_missing");
+	const published = probe.base.payloadRef;
+	expect(parseCanonicalJsonBytes(fixture.artifacts.get(published.digest)!)).toMatchObject({
+		kind: "default_prime_task_specialization",
+		taskId: "probe",
+		specializationKind: "autoresearch",
+	});
+
+	const persisted = parseCanonicalJsonBytes(
+		fixture.auxiliary.get("default-prime-task-runtime-v1.json")!,
+	) as unknown as Record<string, unknown>;
+	expect(persisted.specializations).toEqual(
+		expect.arrayContaining([expect.objectContaining({ extension: { taskId: "probe" } })]),
+	);
+
+	const reopened = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: siblingSpecializationGraph(),
+		maxWorkers: 2,
+		now: () => NOW,
+		workerLauncher: completingLauncher(),
+		autoresearchMeasurable: () => true,
+		prime: primeAdapter(),
+	});
+	await reopened.start();
+	expect(specializationFor(reopened, "probe")?.base).toMatchObject({ kind: "autoresearch" });
+});
+
+it("accepts a persisted runtime record written before specializations existed", async () => {
+	const fixture = runtimeStoreFixture();
+	await runSpecializationFixture(fixture, () => true);
+	const persisted = parseCanonicalJsonBytes(
+		fixture.auxiliary.get("default-prime-task-runtime-v1.json")!,
+	) as unknown as Record<string, unknown>;
+	const { specializations: _dropped, stateDigest: _digest, ...legacy } = persisted;
+	const { pendingCompletions, progressRecoveryWake, ...legacyRequired } = legacy;
+	fixture.auxiliary.set(
+		"default-prime-task-runtime-v1.json",
+		canonicalJsonBytes({
+			...legacy,
+			stateDigest: digestObject({ ...legacyRequired, pendingCompletions, progressRecoveryWake }),
+		}),
+	);
+
+	const reopened = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: siblingSpecializationGraph(),
+		maxWorkers: 2,
+		now: () => NOW,
+		workerLauncher: completingLauncher(),
+		autoresearchMeasurable: () => true,
+		prime: primeAdapter(),
+	});
+	await expect(reopened.start()).resolves.toBeDefined();
+	expect(specializationFor(reopened, "probe")?.base.kind).toBe("autoresearch");
 });

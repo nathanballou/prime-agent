@@ -386,6 +386,92 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
+	it("resumes a saved session in its recorded cwd rather than the daemon's", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const daemonCwd = join(root, "daemon-cwd");
+		const savedCwd = join(root, "saved-project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-saved-cwd-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(daemonCwd, { recursive: true });
+		mkdirSync(savedCwd, { recursive: true });
+		const manager = SessionManager.create(savedCwd, sessionDir);
+		manager.appendSessionInfo("saved-session");
+		const sessionPath = manager.getSessionFile();
+		if (!sessionPath) throw new Error("Missing saved session file");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, daemonCwd);
+		const client = await connectEventually(socketPath, supervisor);
+		const created = await client.request({
+			type: "create",
+			sessionPath,
+			config: { agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) throw new Error("Worker did not expose its session identity");
+		workerPids.add(summary.workerPid);
+
+		expect(summary.cwd).toBe(savedCwd);
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("resumes a saved session in the cwd the caller asked for", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const daemonCwd = join(root, "daemon-cwd");
+		const savedCwd = join(root, "saved-project");
+		const requestedCwd = join(root, "requested-project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-requested-cwd-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(daemonCwd, { recursive: true });
+		mkdirSync(savedCwd, { recursive: true });
+		mkdirSync(requestedCwd, { recursive: true });
+		const manager = SessionManager.create(savedCwd, sessionDir);
+		manager.appendSessionInfo("saved-session");
+		const sessionPath = manager.getSessionFile();
+		if (!sessionPath) throw new Error("Missing saved session file");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, daemonCwd);
+		const client = await connectEventually(socketPath, supervisor);
+		const created = await client.request({
+			type: "create",
+			sessionPath,
+			config: { cwd: requestedCwd, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) throw new Error("Worker did not expose its session identity");
+		workerPids.add(summary.workerPid);
+
+		expect(summary.cwd).toBe(requestedCwd);
+
+		// A live session cannot move: asking the resident one for a different cwd
+		// must fail loudly instead of handing back a session elsewhere.
+		const reused = await client.request({
+			type: "create",
+			sessionPath,
+			config: { cwd: savedCwd, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		expect(reused.success).toBe(false);
+		if (reused.success) throw new Error("Expected the mismatched cwd create to fail");
+		expect(reused.error).toContain(requestedCwd);
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
 	it("publishes a negotiated workflow projection without lazy artifacts or unsafe approval fields", async () => {
 		const root = tempDir();
 		const socketPath = join(
