@@ -203,6 +203,8 @@ export interface AgentSessionWorkflowHostFactoryInput {
 	/** Roots a workflow task may own paths under; absent keeps the built-in default. */
 	primeWorkflowWorkspacePaths?: readonly string[];
 	/** Metric command the host runs to measure a candidate. */
+	/** Session working directory, so the metric command scores the session's repository. */
+	primeWorkflowSessionCwd?: string;
 	primeWorkflowMetricCommand?: {
 		readonly command: string;
 		readonly args: readonly string[];
@@ -736,6 +738,7 @@ export async function createAgentSessionFromServices(
 								workerModelCapabilityAvailability: options.services.workerModelCapabilityAvailability,
 								primeWorkflowResourceLoader: options.services.resourceLoader,
 								primeWorkflowWorkspacePaths: options.services.settingsManager.getWorkflowWorkspacePaths(),
+								primeWorkflowSessionCwd: options.services.cwd,
 								primeWorkflowMetricCommand: options.services.settingsManager.getWorkflowMetricCommand(),
 								approvalSecretDelivery,
 								executionEvidenceSourceDelivery,
@@ -760,6 +763,7 @@ export async function createAgentSessionFromServices(
 								workerModelCapabilityAvailability: options.services.workerModelCapabilityAvailability,
 								primeWorkflowResourceLoader: options.services.resourceLoader,
 								primeWorkflowWorkspacePaths: options.services.settingsManager.getWorkflowWorkspacePaths(),
+								primeWorkflowSessionCwd: options.services.cwd,
 								primeWorkflowMetricCommand: options.services.settingsManager.getWorkflowMetricCommand(),
 								approvalSecretDelivery,
 								executionEvidenceSourceDelivery,

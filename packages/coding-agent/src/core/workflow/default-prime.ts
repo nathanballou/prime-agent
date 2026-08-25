@@ -570,6 +570,12 @@ export interface DefaultPrimeWorkflowProviderInput {
 	readonly workspacePaths?: readonly string[];
 	/** Command the host runs to measure a candidate; absent keeps the measurement refusing. */
 	readonly metricCommand?: { readonly command: string; readonly args: readonly string[]; readonly timeoutMs: number };
+	/**
+	 * Directory the measured repository lives in — the session's cwd, not the worker process's.
+	 * Required rather than optional: a resumed session runs in its own recorded directory while the
+	 * worker process stays in the daemon's, so defaulting here would silently measure the wrong repo.
+	 */
+	readonly sessionCwd: string;
 	readonly resourceLoader?: WorkflowResourceLoaderPort;
 	readonly readStatus: () => WorkflowShellStatus;
 	readonly executionEvidence: WorkflowExecutionEvidenceRuntime;
@@ -2191,9 +2197,10 @@ export async function createDefaultAutoResearchParts(
 			if (metricCommand !== undefined) {
 				const startedAt = Date.now();
 				const executed = await execFileAsync(metricCommand.command, [...metricCommand.args], {
-					// The provider runs in the session process, whose cwd is the repository root — the same
-					// root the scope and immutable-path checks ask git about.
-					cwd: process.cwd(),
+					// The session's cwd, not process.cwd(). A resumed session takes its directory from its
+					// own recorded header while the worker process stays where the daemon was started, so
+					// process.cwd() can point at an entirely different repository than the one being scored.
+					cwd: input.sessionCwd,
 					timeout: metricCommand.timeoutMs,
 					maxBuffer: 8 * 1024 * 1024,
 				}).then(

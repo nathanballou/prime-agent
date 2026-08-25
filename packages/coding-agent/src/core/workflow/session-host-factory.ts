@@ -254,6 +254,8 @@ export interface PersistedSessionWorkflowHostInput {
 	/** Roots a workflow task may own paths under; absent keeps the built-in default. */
 	readonly primeWorkflowWorkspacePaths?: readonly string[];
 	/** Metric command the host runs to measure a candidate. */
+	/** Session working directory, forwarded so the metric command scores the session's repository. */
+	readonly primeWorkflowSessionCwd?: string;
 	readonly primeWorkflowMetricCommand?: {
 		readonly command: string;
 		readonly args: readonly string[];
@@ -1469,6 +1471,10 @@ export async function createPersistedSessionWorkflowHost(
 			...(input.primeWorkflowWorkspacePaths === undefined
 				? {}
 				: { workspacePaths: input.primeWorkflowWorkspacePaths }),
+			// Callers that own a session always pass its cwd; a host composed without one genuinely has
+			// no session directory, and the process cwd is then the only meaningful answer. The bug this
+			// closes was using the process cwd when a session directory DID exist and differed.
+			sessionCwd: input.primeWorkflowSessionCwd ?? process.cwd(),
 			...(input.primeWorkflowMetricCommand === undefined ? {} : { metricCommand: input.primeWorkflowMetricCommand }),
 			readStatus: () => {
 				if (phaseHost === undefined) throw new Error("workflow_phase_host_not_initialized");
