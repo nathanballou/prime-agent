@@ -82,11 +82,14 @@ const recipe = {
  * metricCommand: The operator's configured command, or undefined to leave the host unconfigured.
  * Return: The host ports exposing measureObservation.
  */
-async function hostWith(metricCommand?: {
-	command: string;
-	args: readonly string[];
-	timeoutMs: number;
-}): Promise<AutoResearchHostPorts> {
+async function hostWith(
+	metricCommand?: {
+		command: string;
+		args: readonly string[];
+		timeoutMs: number;
+	},
+	sessionCwd: string = process.cwd(),
+): Promise<AutoResearchHostPorts> {
 	const input = {
 		runtimeStore: { identity: { workflowId: WORKFLOW_ID }, durableContext: {} },
 		artifactResolver: {
@@ -111,6 +114,7 @@ async function hostWith(metricCommand?: {
 			protectedInvariantIds: PROTECTED_INVARIANT_IDS,
 		}),
 		metricCommand,
+		sessionCwd,
 	} as unknown as DefaultPrimeWorkflowProviderInput;
 	return (await createDefaultAutoResearchParts(input, recipe)).host;
 }
@@ -123,8 +127,12 @@ async function hostWith(metricCommand?: {
  * timeoutMs: Timeout the operator configured for the command.
  * Return: The host measurement, crashed or complete.
  */
-async function measure(script?: string, timeoutMs = 30_000): Promise<AutoResearchHostMeasurement> {
-	const host = await hostWith(script === undefined ? undefined : { command: script, args: [], timeoutMs });
+async function measure(
+	script?: string,
+	timeoutMs = 30_000,
+	sessionCwd: string = process.cwd(),
+): Promise<AutoResearchHostMeasurement> {
+	const host = await hostWith(script === undefined ? undefined : { command: script, args: [], timeoutMs }, sessionCwd);
 	return host.measureObservation({
 		observationId: "observation-1",
 		candidateId: CANDIDATE_ID,
@@ -260,10 +268,33 @@ describe("default Prime autoresearch host measurement", () => {
 		);
 		await chmod(script, 0o755);
 
-		const measurement = await measure(script);
+		const measurement = await measure(script, 30_000, dir);
 
 		expect(measurement.status).toBe("complete");
-		expect((await readFile(marker, "utf8")).trim()).toBe(await realpath(process.cwd()));
+		expect((await readFile(marker, "utf8")).trim()).toBe(await realpath(dir));
+	});
+
+	it("runs the command in the session directory even when the process sits elsewhere", async () => {
+		// A resumed session takes its directory from its own recorded header while the worker process
+		// stays where the daemon was started. Before the session cwd was threaded through, the command
+		// ran at process.cwd() and could score a different repository than the session was editing —
+		// succeeding, and journalling that number as candidate evidence.
+		const sessionDir = await realpath(await mkdtemp(join(tmpdir(), "metric-command-session-")));
+		const scriptDir = await mkdtemp(join(tmpdir(), "metric-command-script-"));
+		const marker = join(scriptDir, "cwd");
+		const script = join(scriptDir, "measure.sh");
+		await writeFile(
+			script,
+			`#!/bin/sh\npwd -P > ${marker}\necho '{"metricValue":1,"baselineMetricValue":2,"sampleCount":1,"variance":0}'\n`,
+		);
+		await chmod(script, 0o755);
+
+		const measurement = await measure(script, 30_000, sessionDir);
+
+		expect(measurement.status).toBe("complete");
+		const observed = (await readFile(marker, "utf8")).trim();
+		expect(observed).toBe(sessionDir);
+		expect(observed).not.toBe(await realpath(process.cwd()));
 	});
 
 	it("refuses to measure a candidate result the host cannot verify", async () => {
