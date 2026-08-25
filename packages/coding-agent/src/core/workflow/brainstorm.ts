@@ -18,6 +18,7 @@ import {
 	WORKFLOW_TASK_ROLES,
 	type WorkflowTaskRole,
 	workflowComputeClassForRole,
+	workflowSkillsForRole,
 } from "./recipes.js";
 import type {
 	WorkflowGoalAuthoritySourceRequest,
@@ -107,6 +108,8 @@ export interface WorkflowTaskGraphSourceTask {
 	readonly recovery: "retry" | "replan" | "block";
 	/** Cheapest worker tier this task needs. Omitted means standard. */
 	readonly computeClass?: WorkflowComputeClass;
+	/** Skills this task carries; a role's defaults are unioned in and cannot be dropped. */
+	readonly skills?: readonly string[];
 	/** Role this task plays, drawn from the closed host vocabulary. Omitted means implementation. */
 	readonly role?: WorkflowTaskRole;
 	readonly authority: readonly WorkflowAuthorityCapability[];
@@ -228,6 +231,7 @@ function normalizeTaskGraphSourceTask(value: unknown): WorkflowTaskGraphSourceTa
 		"ownedPaths",
 		"ownedContracts",
 		"computeClass",
+		"skills",
 		"role",
 	]);
 	if (Object.keys(value).some((key) => !allowedKeys.has(key)))
@@ -254,6 +258,10 @@ function normalizeTaskGraphSourceTask(value: unknown): WorkflowTaskGraphSourceTa
 	// The role floor wins over the plan's guess, so under-tiering the task everything downstream
 	// depends on is not something a planner can do by omission.
 	const computeClass = workflowComputeClassForRole(role, declaredComputeClass);
+	// Same shape as the tier floor: a role's corrections travel with the role instead of being sent
+	// as instructions each run. A plan may add skills; it cannot drop the ones its role always needs.
+	const declaredSkills = value.skills === undefined ? [] : canonicalStrings(value.skills, "skills", true, 128);
+	const skills = workflowSkillsForRole(role, declaredSkills);
 	const requirementIds = canonicalStrings(value.requirementIds, "requirements", false, 256);
 	const completionCriteria = canonicalStrings(value.completionCriteria, "completion", false, 8_192);
 	const dependencyTaskIds = canonicalStrings(value.dependencyTaskIds, "dependencies", true, 128);
@@ -347,6 +355,7 @@ function normalizeTaskGraphSourceTask(value: unknown): WorkflowTaskGraphSourceTa
 		...(ownedPaths.length === 0 ? {} : { ownedPaths }),
 		...(ownedContracts.length === 0 ? {} : { ownedContracts }),
 		...(computeClass === undefined ? {} : { computeClass }),
+		...(skills.length === 0 ? {} : { skills }),
 		...(role === undefined ? {} : { role }),
 	});
 }

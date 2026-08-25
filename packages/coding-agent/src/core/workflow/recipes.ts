@@ -1095,6 +1095,54 @@ const WORKFLOW_ROLE_COMPUTE_FLOOR: Readonly<Partial<Record<WorkflowTaskRole, Wor
 	});
 
 /**
+ * Skills every task of a role gets whether or not the plan asked for them.
+ *
+ * A role's failure modes are the same every run, so the correction belongs on the role rather than in
+ * a message sent after the fact. Ceremony is the dominant one: roles that build or attack things
+ * elaborate specifications, perfect output envelopes, and register paperwork instead of producing the
+ * artifact, so they carry "ponytail". Roles that decide whether something is finished carry
+ * "verification-before-completion", because the failure there is declaring success without evidence.
+ *
+ * This map only ever ADDS. A plan may name more skills; it can never drop a role's defaults, which is
+ * what makes the guidance internal rather than advisory.
+ */
+const WORKFLOW_ROLE_DEFAULT_SKILLS: Readonly<Partial<Record<WorkflowTaskRole, readonly string[]>>> = Object.freeze({
+	"red-team": Object.freeze(["ponytail", "systematic-debugging"]),
+	attack: Object.freeze(["ponytail", "systematic-debugging"]),
+	implementation: Object.freeze(["ponytail", "test-driven-development"]),
+	integration: Object.freeze(["ponytail", "test-driven-development"]),
+	"edge-test": Object.freeze(["test-driven-development", "verification-before-completion"]),
+	verify: Object.freeze(["verification-before-completion"]),
+	verification: Object.freeze(["verification-before-completion"]),
+	judge: Object.freeze(["verification-before-completion"]),
+	unify: Object.freeze(["verification-before-completion"]),
+	planning: Object.freeze(["writing-plans"]),
+	design: Object.freeze(["brainstorming", "writing-plans"]),
+	architect: Object.freeze(["brainstorming"]),
+	recon: Object.freeze(["systematic-debugging"]),
+	review: Object.freeze(["verification-before-completion"]),
+});
+
+/**
+ * Union a task's declared skills with the defaults its role always carries.
+ *
+ * Args:
+ * role: Task role from the plan, or undefined when the plan named none.
+ * declared: Skills the plan asked for, or undefined when it named none.
+ * Return: Declared skills first in their original order, then role defaults not already present.
+ */
+export function workflowSkillsForRole(
+	role: WorkflowTaskRole | undefined,
+	declared: readonly string[] | undefined,
+): readonly string[] {
+	const defaults = role === undefined ? undefined : WORKFLOW_ROLE_DEFAULT_SKILLS[role];
+	if (defaults === undefined) return declared ?? [];
+	const merged = [...(declared ?? [])];
+	for (const skill of defaults) if (!merged.includes(skill)) merged.push(skill);
+	return Object.freeze(merged);
+}
+
+/**
  * Raise a declared compute class to its role's floor.
  *
  * Args:
