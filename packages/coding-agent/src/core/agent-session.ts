@@ -331,6 +331,7 @@ import {
 	trackedUnder,
 	worktreesWithChanges,
 } from "./workflow/agent-collaboration.js";
+import { resolveAutoresearchTask } from "./workflow/autoresearch-entry.js";
 import {
 	createWorkflowBrainstormState,
 	createWorkflowProposalTool,
@@ -1219,15 +1220,11 @@ export interface WorkflowKernelHostBindings {
  * workflowHost: Bound workflow host exposing the Prime task specializations.
  * Return: Nothing; throws when no node is in autoresearch.
  */
-export function assertWorkflowAutoresearchEntered(workflowHost: WorkflowKernelHostBindings): void {
-	const specializations = workflowHost.primeWorkflow?.taskSpecializations?.() ?? [];
-	if (specializations.some((entry) => entry.base.kind === "autoresearch")) return;
-	const blocked = specializations
-		.map((entry) => `${entry.extension.taskId}=${entry.base.statusTag ?? entry.base.phaseTag}`)
-		.join(", ");
-	throw new Error(
-		`No workflow node has entered autoresearch${blocked.length === 0 ? "." : `: ${blocked}.`} Autoresearch runs on a node whose contract is frozen, whose baseline exists, and whose metric command is configured.`,
-	);
+export function assertWorkflowAutoresearchEntered(
+	workflowHost: WorkflowKernelHostBindings,
+	requestedTaskId?: string,
+): string {
+	return resolveAutoresearchTask(workflowHost.primeWorkflow?.taskSpecializations?.() ?? [], requestedTaskId);
 }
 
 interface WorkflowKernelOwnership {
@@ -2502,6 +2499,8 @@ export class AgentSession {
 						return this.executeWorkflowHostRequest("workflow.v1.autoresearch.run", {
 							recipe_digest: workflowHost.primeWorkflow?.snapshots?.recipe.recipeDigest,
 							evidence_refs: [],
+							// Name the node so the run is scoped to the stage that actually qualified.
+							task_id: resolveAutoresearchTask(workflowHost.primeWorkflow?.taskSpecializations?.() ?? []),
 						});
 					}
 					if (input.skillName === "mempalace") {
