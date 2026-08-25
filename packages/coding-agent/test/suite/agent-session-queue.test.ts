@@ -2892,6 +2892,30 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual([]);
 	});
 
+	it("reports success when resuming lifts an abort suspension with an empty queue", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("recovered after resume")]);
+		harness.session.requestAbort();
+
+		// Recovery must report that it lifted the suspension, not whether work happens to be queued.
+		// Returning _hasSelectableSessionInput() made an idle stranded session look unrecoverable:
+		// the daemon maps false to "No queued work to resume" even though admission was just restored.
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+
+		const body = agentPromptText("agentmsg_after_resume_queue", "child result");
+		await harness.session.acceptAgentMessagePrompt(body);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([body]);
+	});
+
+	it("reports no work to resume when nothing was suspended and nothing is queued", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		expect(harness.session.resumeQueuedWork()).toBe(false);
+	});
+
 	it("waitForIdle resolves when the queue is cleared while the pump is suspended", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

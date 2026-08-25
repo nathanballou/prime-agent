@@ -9402,12 +9402,22 @@ export class AgentSession {
 		this._flushDeferredRlmTerminalNotices();
 	}
 
-	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
+	/**
+	 * Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases
+	 * are unaffected.
+	 *
+	 * Return: True when this call lifted a suspension or left selectable input to run.
+	 */
 	resumeQueuedWork(): boolean {
+		// Report whether the call did something, not merely whether work is waiting. Callers treat
+		// false as failure — daemon `resume_queue` turns it into "No queued work to resume" — so an
+		// idle session stranded by an abort reported failure while its admission had in fact just
+		// been restored, which reads as "this session cannot be recovered".
+		const liftedSuspension = this._sessionInputPumpSuspended;
 		this._resumeSessionInputAdmission();
 		this._maybeResumeGoalContinuationAfterRlmWork();
 		this._scheduleSessionInputPump();
-		return this._hasSelectableSessionInput();
+		return liftedSuspension || this._hasSelectableSessionInput();
 	}
 
 	async waitForSessionInputIdle(): Promise<void> {
