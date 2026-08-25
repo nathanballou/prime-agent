@@ -275,6 +275,7 @@ function freezeTask(task: WorkflowTask): WorkflowTask {
 		ownedPaths: freezeStrings(task.ownedPaths),
 		ownedContracts: freezeStrings(task.ownedContracts),
 		requiredSkillSnapshotDigests: freezeStrings(task.requiredSkillSnapshotDigests),
+		...(task.skills === undefined ? {} : { skills: freezeStrings(task.skills) }),
 		verificationCommandDigests: freezeStrings(task.verificationCommandDigests),
 		authority: Object.freeze([...task.authority]),
 		declaredResourceVector: freezeResourceVector(task.declaredResourceVector),

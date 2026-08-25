@@ -3247,6 +3247,7 @@ function defaultTasks(input: {
 		boundaryIds: [...task.boundaryIds],
 		outputRefs: [...task.outputRefs],
 		...(task.computeClass === undefined ? {} : { computeClass: task.computeClass }),
+		...(task.skills === undefined ? {} : { skills: [...task.skills] }),
 		evidencePolicy: { ...task.evidencePolicy },
 		evidenceKind: task.evidencePolicy.kind,
 		budget: { ...task.budget },

@@ -1497,6 +1497,8 @@ export interface WorkflowTask {
 	ownedPaths: readonly string[];
 	ownedContracts: readonly string[];
 	requiredSkillSnapshotDigests: readonly string[];
+	/** Skills this task's worker is directed by; the role's defaults are unioned in at normalization. */
+	skills?: readonly string[];
 	verificationCommandDigests: readonly string[];
 	authority: readonly WorkflowAuthorityCapability[];
 	declaredResourceVector: WorkflowResourceVector;

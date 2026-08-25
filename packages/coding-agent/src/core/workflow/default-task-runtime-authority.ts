@@ -38,7 +38,7 @@ import { leaseRefOf } from "./dispatch.js";
 import type { WorkflowEffectBroker } from "./effect-broker.js";
 import type { WorkflowLeaseManager } from "./leases.js";
 import type { WorkflowExternalBlockerInput } from "./phase-host.js";
-import { WORKFLOW_WRITE_AUTHORITY_CAPABILITIES } from "./recipes.js";
+import { WORKFLOW_WRITE_AUTHORITY_CAPABILITIES, workflowSkillPromptLines } from "./recipes.js";
 import type { WorkflowReconciliationOutcome, WorkflowRecoveryRequest } from "./recovery.js";
 import type { WorkflowRuntimeRecoveryCoordinator } from "./runtime-recovery.js";
 import type { WorkflowScheduler, WorkflowSchedulerEvent, WorkflowSchedulerState } from "./scheduler.js";
@@ -3333,7 +3333,11 @@ export function createDefaultTaskRuntimeAuthority(
 				executionKey: request.executionKey,
 				epochRef: input.epochRef,
 				deadlineAt: resourceLease.expiresAt,
-				prompt: taskCapsule === null ? request.task.objective : taskCapsulePrompt(taskCapsule),
+				// The direction rides the prompt itself: a skill listed anywhere the worker cannot see
+				// directs nothing.
+				prompt:
+					(taskCapsule === null ? request.task.objective : taskCapsulePrompt(taskCapsule)) +
+					workflowSkillPromptLines(request.task.skills),
 				taskCapsule: taskCapsule ?? undefined,
 				sessionName: `prime-${request.task.taskId}`,
 				...(request.task.computeClass === undefined ? {} : { computeClass: request.task.computeClass }),

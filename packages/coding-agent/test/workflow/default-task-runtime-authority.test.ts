@@ -2935,6 +2935,56 @@ function specializationFor(
 	return (authority.specializations?.() ?? []).find((entry) => entry.extension.taskId === taskId);
 }
 
+it("puts a task's skills in front of the worker, stated as intent", async () => {
+	// The intent under test: a worker launched for a skilled task is DIRECTED by those skills in the
+	// prompt it actually receives. Where the list is stored, how it is merged, and which resolver
+	// computed it are implementation - a worker that never sees the direction proves none of it.
+	const fixture = runtimeStoreFixture();
+	const skilled = {
+		...task("skilled"),
+		skills: ["test-driven-development", "ponytail"],
+	} as WorkflowTask;
+	const tasks = [skilled];
+	const prompts: string[] = [];
+	const launcher: TestWorkerLauncher = async (request) => {
+		prompts.push(request.prompt);
+		return completingLauncher()(request);
+	};
+	const authority = createDefaultTaskRuntimeAuthority({
+		runtimeStore: fixture.store,
+		workflowId: WORKFLOW_ID,
+		rootSessionId: ROOT_SESSION_ID,
+		epochRef: EPOCH,
+		decisionRef: decisionRef(),
+		goalRevisionDigest: GOAL_REVISION_DIGEST,
+		graph: {
+			graphRevision: 1,
+			tasks,
+			byId: new Map(tasks.map((stage) => [stage.taskId, stage])),
+			allowedAuthority: ["read_workspace"],
+			ownershipPaths: [],
+			generatedOutputPaths: [],
+			lockPaths: [],
+			namedContracts: [],
+			graphDigest: digestObject(tasks),
+		},
+		maxWorkers: 1,
+		now: () => NOW,
+		workerLauncher: launcher,
+		autoresearchMeasurable: () => false,
+		prime: primeAdapter(),
+	});
+	await authority.start();
+	await vi.waitFor(() => {
+		expect(prompts).toHaveLength(1);
+	});
+	// The two defaults this program keeps correcting by message: tests must state intent rather than
+	// restate implementation, and the artifact beats ceremony.
+	expect(prompts[0]).toMatch(/intent/i);
+	expect(prompts[0]).toMatch(/written twice|mirrors the (code|implementation)/i);
+	expect(prompts[0]).toContain("ponytail");
+});
+
 it("holds a different specialization kind on each sibling node at the same time", async () => {
 	const fixture = runtimeStoreFixture();
 	const authority = await runSpecializationFixture(fixture, () => true);

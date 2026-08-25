@@ -1124,6 +1124,51 @@ const WORKFLOW_ROLE_DEFAULT_SKILLS: Readonly<Partial<Record<WorkflowTaskRole, re
 });
 
 /**
+ * What each skill directs a worker to do, in one or two sentences the worker actually reads.
+ *
+ * A skill name in a list directs nothing. The worker sees a prompt, so the essence has to be in the
+ * prompt - and the essence is intent, not procedure. The two lines this program has had to send as
+ * corrections most often are here verbatim: tests state intent rather than restating implementation,
+ * and the artifact beats ceremony.
+ */
+const WORKFLOW_SKILL_DIRECTIVES: Readonly<Record<string, string>> = Object.freeze({
+	"test-driven-development":
+		"Write the failing test that states the INTENT - the behavior needed - before any implementation. " +
+		"Never restate the implementation as assertions: a test that mirrors the code is the same thing " +
+		"written twice and proves nothing. If the implementation changes and the intent does not, a good test stays green.",
+	ponytail:
+		"Deliver the smallest thing that satisfies the intent. Specifications, output envelopes, and " +
+		"registration paperwork are not the artifact; if 200 lines could be 50, write 50, and if a step " +
+		"exists only to look rigorous, drop it.",
+	"systematic-debugging":
+		"Reproduce the failure before fixing anything, then fix the root cause where all callers route " +
+		"through - not the symptom the report names.",
+	"verification-before-completion":
+		"Do not declare success without evidence produced by actually running the thing. Planning is not " +
+		"evidence, and a check you did not run is a claim.",
+	brainstorming:
+		"Explore the decision space before committing: name the readings of the problem and what each would change.",
+	"writing-plans":
+		"State success criteria and the checks that prove them before work starts; a plan without its check is a hope.",
+});
+
+/**
+ * Render the prompt lines that put a task's skills in front of its worker.
+ *
+ * Args:
+ * skills: Skill names the task carries, or undefined when it carries none.
+ * Return: Prompt lines directing the worker, or an empty string when there is nothing to direct.
+ */
+export function workflowSkillPromptLines(skills: readonly string[] | undefined): string {
+	if (skills === undefined || skills.length === 0) return "";
+	const lines = skills.map((skill) => {
+		const directive = WORKFLOW_SKILL_DIRECTIVES[skill];
+		return directive === undefined ? `- ${skill}` : `- ${skill}: ${directive}`;
+	});
+	return `\n\nSkills in force for this task:\n${lines.join("\n")}`;
+}
+
+/**
  * Union a task's declared skills with the defaults its role always carries.
  *
  * Args:
