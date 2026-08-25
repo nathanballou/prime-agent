@@ -81,13 +81,29 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     )
 
 
-async def host_request(request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+# Bound on how long a cell waits for a host comm reply before failing loudly.
+HOST_REQUEST_TIMEOUT_SECONDS = 120.0
+
+
+async def host_request(
+    request_type: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float | None = HOST_REQUEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     """Send a typed request to the Prime Agent host and await its reply.
 
     This is the kernel side of the generic host bridge: Python skills call
     ``await host_request("<type>", {...})`` and the TypeScript host dispatches
     on the type. Raises RuntimeError when the host reports an error or when no
     handler for the type is registered in this session.
+
+    Raises TimeoutError when the host sends no reply within ``timeout`` seconds.
+    The host can fail to reply at all — sending the comm reply throws when the
+    kernel channel is not connected, and the error-reply fallback throws for the
+    same reason — so without a bound the cell waits forever and the kernel looks
+    dead. That is most likely for calls made right after a restart or compaction,
+    which is exactly when ``rlm.list_subagents()`` is documented to be used.
+    Pass ``timeout=None`` to wait indefinitely.
     """
     if not isinstance(request_type, str) or not request_type:
         raise TypeError("request_type must be a non-empty str")
@@ -138,7 +154,16 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
     # request_type goes last so a payload "type" key cannot reroute the request.
     comm.open(data={**(payload or {}), "type": request_type})
     try:
-        return await future
+        if timeout is None:
+            return await future
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"host request {request_type} received no reply within {timeout:g}s. "
+                "The host may have failed to deliver the comm reply; retry, and if it "
+                "persists restart the kernel."
+            ) from None
     finally:
         if not future.done():
             future.cancel()
