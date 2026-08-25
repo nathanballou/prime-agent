@@ -4,6 +4,7 @@ import type {
 	WorkflowOutboxAppender,
 	WorkflowRuntimeStore,
 	WorkflowRuntimeStoreDurableContext,
+	WorkflowTaskSpecializationProjection,
 } from "./contracts.js";
 import { digestObject } from "./contracts.js";
 import {
@@ -171,6 +172,8 @@ export interface WorkflowTaskRuntimeAuthority {
 		readonly classification: WorkflowTaskRuntimeEvidenceClassification;
 	}): Promise<void>;
 	readState(): Promise<WorkflowSchedulerState>;
+	/** Per-node methodology as of the last ready-task evaluation; absent on authorities that do not model it. */
+	specializations?(): readonly WorkflowTaskSpecializationProjection[];
 	readAudit(): Promise<WorkflowTaskRuntimeAudit>;
 	recover(request: WorkflowRecoveryRequest): Promise<WorkflowReconciliationOutcome>;
 	reassign(input: {

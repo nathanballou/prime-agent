@@ -20,7 +20,7 @@ import {
 	classifyDaemonRuntimeMismatch,
 } from "../modes/daemon/daemon-runtime-identity.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
-import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
+import type { DaemonWorkflowStatusProjection, SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
@@ -970,9 +970,21 @@ function formatWorkflowStatusText(summary: SessionSummary): string {
 		`Next task: ${workflow.nextTask ?? "none"}`,
 		`Blocker: ${workflow.blocker ? `${workflow.blocker.kind}: ${workflow.blocker.reason}` : "none"}`,
 		`Journal head: ${workflow.headDigest ?? "unknown"}`,
+		`Node methodology: ${formatWorkflowSpecializations(workflow)}`,
 		`Attempts: ${workflow.attempts?.length ?? 0}`,
 		`Leases: ${workflow.leases?.length ?? 0}`,
 	].join("\n");
+}
+
+function formatWorkflowSpecializations(workflow: DaemonWorkflowStatusProjection): string {
+	const specializations = workflow.specializations ?? [];
+	if (specializations.length === 0) return "unavailable";
+	return specializations
+		.map(
+			(entry) =>
+				`${entry.taskId}=${entry.kind}/${entry.phaseTag}${entry.statusTag === undefined ? "" : `(${entry.statusTag})`}`,
+		)
+		.join(" ");
 }
 
 async function workflowStatusCapabilitiesForClient(client: DaemonClient): Promise<readonly DaemonClientCapability[]> {

@@ -455,6 +455,22 @@ it("binds the default production Prime provider through AgentSession workflow st
 			created.session.executeWorkflowHostRequest("workflow.v1.execution_evidence.read", {}),
 		).resolves.toMatchObject({ state_digest: expect.stringMatching(/^[0-9a-f]{64}$/u), can_authorize: false });
 
+		// Autoresearch entry is per-node workflow state: recon is the recipe's declared autoresearch
+		// stage, and every other node stays in native methodology because this session configures no
+		// metric command. Both kinds are held at once, by different nodes of one live graph.
+		const specializations = created.session.getWorkflowStatusProjection()?.specializations ?? [];
+		expect(specializations.find((entry) => entry.taskId === "recon")).toMatchObject({
+			kind: "autoresearch",
+			phaseTag: "experiment",
+			statusTag: "contract_declared",
+		});
+		expect(specializations.filter((entry) => entry.taskId !== "recon").length).toBeGreaterThan(0);
+		expect(
+			specializations
+				.filter((entry) => entry.taskId !== "recon")
+				.every((entry) => entry.kind === "native_methodology" && entry.statusTag === "metric_command_unconfigured"),
+		).toBe(true);
+
 		const autoresearchResult = await created.session.executeWorkflowSkill({ skillName: "workflow-autoresearch" });
 		expect(autoresearchResult.skill_id).toBe("autoresearch");
 		expect(Array.isArray(autoresearchResult.evidence_refs)).toBe(true);

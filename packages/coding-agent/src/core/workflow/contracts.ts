@@ -2227,6 +2227,11 @@ export interface WorkflowSpecializationProjectionWrapper<TPayload> {
 	extension: TPayload;
 }
 
+/** Specialization projection bound to the DAG node whose methodology it reports. */
+export type WorkflowTaskSpecializationProjection = WorkflowSpecializationProjectionWrapper<{
+	readonly taskId: string;
+}>;
+
 export type ResourceVector = WorkflowResourceVector;
 export type ResourceLeaseRef = Pick<
 	WorkflowResourceLease,

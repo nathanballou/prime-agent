@@ -127,3 +127,72 @@ function makeSummary(options: {
 		modified: "2026-05-29T10:00:00.000Z",
 	};
 }
+
+describe("workflow specialization column", () => {
+	it("marks how many nodes are in autoresearch", () => {
+		const table = stripAnsi(
+			formatSessionListTable(
+				[
+					makeSummary({
+						name: "research",
+						id: "1111222233334",
+						lifecycle: "live",
+						activity: "working",
+						workflowStatus: {
+							workflowId: "workflow-2",
+							status: "active",
+							phase: "executing",
+							nextGate: null,
+							nextTask: null,
+							blocker: null,
+							headDigest: "head-immutable-2",
+							approvalRequest: null,
+							specializations: [
+								{ taskId: "probe", kind: "autoresearch", phaseTag: "experiment", statusTag: "ready" },
+								{
+									taskId: "sketch",
+									kind: "native_methodology",
+									phaseTag: "task_execution",
+									statusTag: "contract_unowned",
+								},
+							],
+						} satisfies DaemonWorkflowStatusProjection,
+					}),
+				],
+				Date.parse("2026-05-29T12:00:00.000Z"),
+			),
+		);
+
+		expect(table).toContain("active/executing+autoresearch:1");
+	});
+
+	it("leaves the column unchanged when no node is in autoresearch", () => {
+		const table = stripAnsi(
+			formatSessionListTable(
+				[
+					makeSummary({
+						name: "native",
+						id: "5555666677778",
+						lifecycle: "live",
+						activity: "working",
+						workflowStatus: {
+							workflowId: "workflow-3",
+							status: "active",
+							phase: "executing",
+							nextGate: null,
+							nextTask: null,
+							blocker: null,
+							headDigest: "head-immutable-3",
+							approvalRequest: null,
+							specializations: [{ taskId: "probe", kind: "native_methodology", phaseTag: "task_execution" }],
+						} satisfies DaemonWorkflowStatusProjection,
+					}),
+				],
+				Date.parse("2026-05-29T12:00:00.000Z"),
+			),
+		);
+
+		expect(table).toContain("active/executing");
+		expect(table).not.toContain("autoresearch");
+	});
+});

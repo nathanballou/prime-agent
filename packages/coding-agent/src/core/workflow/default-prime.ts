@@ -1016,6 +1016,11 @@ async function composeDefaultPrimeWorkflow(
 						withHostLeaseOperation: input.withHostLeaseOperation,
 						readWorkflowStatus: input.readStatus,
 						beforeTaskLaunch: input.beforeTaskLaunch,
+						autoresearchMeasurable: () => input.metricCommand !== undefined,
+						// The built-in adaptive recipe accepts only autoresearch evidence for its recon stage
+						// (see recordPipelineStageInternal), so that node's methodology is declared, not discovered.
+						autoresearchContractedTaskIds:
+							snapshots.recipe.recipeId === BUILTIN_DEFAULT_PRIME_ADAPTIVE_RECIPE.recipeId ? ["recon"] : [],
 						prime: taskRuntimePrimeAdapter,
 					})
 				: await input.taskRuntimeAuthorityFactory({
@@ -1373,6 +1378,7 @@ async function composeDefaultPrimeWorkflow(
 		adapters,
 		taskGraph,
 		readSchedulerState: taskRuntime.read,
+		taskSpecializations: () => taskRuntime.specializations(),
 		epochRef: input.epochRef,
 		executeSkillIteration,
 		recordSkillOutcome: async (skillName, result) => {

@@ -36,6 +36,7 @@ import type {
 	WorkflowRuntimeConfigSnapshot,
 	WorkflowRuntimeStore,
 	WorkflowStoreReplayResult,
+	WorkflowTaskSpecializationProjection,
 	WorkflowTrustedPrincipal,
 	WorkflowVerifiedHostReceipt,
 } from "./contracts.js";
@@ -160,6 +161,7 @@ export interface ProductionPrimeWorkflowInput {
 	readonly adapters: PrimeWorkflowAuthenticatedAdapters;
 	readonly taskGraph?: WorkflowTaskGraph;
 	readonly readSchedulerState?: () => Promise<WorkflowSchedulerState>;
+	readonly taskSpecializations?: () => readonly WorkflowTaskSpecializationProjection[];
 	/** Host-owned fresh invocation seam; callers never provide token material. */
 	readonly executeSkillIteration?: <TResult>(input: {
 		readonly skillName: string;
@@ -180,6 +182,8 @@ export interface ProductionPrimeWorkflow {
 	readonly snapshots: PrimeWorkflowSnapshots;
 	readonly taskGraph?: WorkflowTaskGraph;
 	readonly readSchedulerState?: () => Promise<WorkflowSchedulerState>;
+	/** Per-node methodology as of the last ready-task evaluation; drives the autoresearch entry gate. */
+	readonly taskSpecializations?: () => readonly WorkflowTaskSpecializationProjection[];
 	/** Current host-authenticated recipe and evidence rules injected into every durable planner continuation. */
 	readonly plannerDirective: string;
 	readonly initializationOrder: readonly PrimeWorkflowInitializationStep[];
@@ -1736,6 +1740,7 @@ export async function createProductionPrimeWorkflow(
 		snapshots,
 		...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
 		...(input.readSchedulerState === undefined ? {} : { readSchedulerState: input.readSchedulerState }),
+		...(input.taskSpecializations === undefined ? {} : { taskSpecializations: input.taskSpecializations }),
 		get plannerDirective(): string {
 			return primePlannerDirective(
 				snapshots,
