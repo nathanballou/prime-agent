@@ -135,6 +135,21 @@ function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
 	throw new Error("Worker descriptor was not persisted");
 }
 
+function readWorkerDescriptorEntries(agentDir: string): Array<{ path: string; descriptor: DaemonWorkerDescriptor }> {
+	const workersRoot = join(agentDir, "daemon-workers");
+	const entries: Array<{ path: string; descriptor: DaemonWorkerDescriptor }> = [];
+	for (const directory of readdirSync(workersRoot)) {
+		const descriptorDirectory = join(workersRoot, directory);
+		for (const name of readdirSync(descriptorDirectory)) {
+			if (name.endsWith(".json")) {
+				const path = join(descriptorDirectory, name);
+				entries.push({ path, descriptor: JSON.parse(readFileSync(path, "utf8")) as DaemonWorkerDescriptor });
+			}
+		}
+	}
+	return entries;
+}
+
 function countWorkerDescriptors(agentDir: string): number {
 	const workersRoot = join(agentDir, "daemon-workers");
 	try {
@@ -177,8 +192,8 @@ function readSupervisorConfig(agentDir: string): { defaultSessionConfig?: { sess
 	throw new Error("Supervisor config was not persisted");
 }
 
-async function connectEventually(socketPath: string, child?: ChildProcess): Promise<DaemonClient> {
-	const deadline = Date.now() + 15_000;
+async function connectEventually(socketPath: string, child?: ChildProcess, timeoutMs = 15_000): Promise<DaemonClient> {
+	const deadline = Date.now() + timeoutMs;
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		if (child && (child.exitCode !== null || child.signalCode !== null)) {
@@ -337,6 +352,93 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 	await waitForCondition(() => existsSync(readyPath), `Blocking bash process did not become ready: ${readyPath}`);
 }
 
+function processIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function readWorkerLifecycle(agentDir: string): string | undefined {
+	try {
+		return readWorkerDescriptor(agentDir).lifecycle;
+	} catch {
+		// The descriptor may be mid-rewrite.
+		return undefined;
+	}
+}
+
+/**
+ * Reproduce the state that locked a resident session out permanently: a worker
+ * process that is alive but unreachable, registered to a supervisor that has
+ * given up on it and persisted `lifecycle: "failed"`. SIGSTOP is what holds the
+ * worker unreachable, and it also keeps the orphan from launching a replacement
+ * supervisor of its own while this fixture installs one.
+ * Args:
+ * agentDir: Agent directory holding the daemon's worker descriptors.
+ * projectDir: Working directory for the supervisor and its worker.
+ * sessionDir: Directory holding the fixture session transcript.
+ * socketPath: Daemon socket shared by both supervisors.
+ * sessionFile: Saved session transcript the resident worker opens.
+ * Return: Client for the replacement supervisor, plus the wedged worker's
+ * summary and still-live pid.
+ */
+async function wedgeFailedWorkerWithLiveProcess(
+	agentDir: string,
+	projectDir: string,
+	sessionDir: string,
+	socketPath: string,
+	sessionFile: string,
+): Promise<{ client: DaemonClient; summary: SessionSummary; workerPid: number }> {
+	const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+	const firstClient = await connectEventually(socketPath, firstSupervisor);
+	const firstSupervisorPid = firstClient.hello?.supervisorPid;
+	if (!firstSupervisorPid) {
+		throw new Error("Daemon hello did not expose its supervisor pid");
+	}
+	const created = await firstClient.request({
+		type: "create",
+		sessionPath: sessionFile,
+		config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+	});
+	if (!created.success) {
+		throw new Error(created.error);
+	}
+	const summary = requireSummary(created.data);
+	const workerPid = summary.workerPid;
+	if (!workerPid) {
+		throw new Error("Resident worker did not expose its pid");
+	}
+	workerPids.add(workerPid);
+
+	process.kill(workerPid, "SIGSTOP");
+	process.kill(firstSupervisorPid, "SIGKILL");
+	await waitForExit(firstSupervisor);
+	children.delete(firstSupervisor);
+	firstClient.close();
+
+	// With restart resume enabled the replacement supervisor would stop and
+	// relaunch this wedged-but-live worker at startup instead of marking it
+	// failed; these tests need the failed descriptor to exercise create-time
+	// reclaim, so opt the daemon out of resume.
+	writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ resumeSessionsOnRestart: false })}\n`);
+
+	// The supervisor only answers its handshake once every descriptor is adopted,
+	// and giving up on this unreachable worker takes three recovery attempts.
+	const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+	const client = await connectEventually(socketPath, replacementSupervisor, 60_000);
+	await waitForCondition(
+		() => readWorkerLifecycle(agentDir) === "failed",
+		"Replacement supervisor never marked the unreachable worker failed",
+		30_000,
+	);
+	if (!processIsAlive(workerPid)) {
+		throw new Error("Wedged worker process died before the reclaim could be exercised");
+	}
+	return { client, summary, workerPid };
+}
 describe("daemon supervisor resident workers", () => {
 	it("accepts the canonical socket path when launched with duplicate slashes", async () => {
 		if (process.platform === "win32") return;
@@ -1392,6 +1494,113 @@ describe("daemon supervisor resident workers", () => {
 		}
 	});
 
+	it("stops a live failed worker so its session can be recreated", {
+		tags: ["process-stress"],
+		timeout: 90_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-failed-live-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "reclaim me", timestamp: 1 });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+		const { client, summary, workerPid } = await wedgeFailedWorkerWithLiveProcess(
+			agentDir,
+			projectDir,
+			sessionDir,
+			socketPath,
+			sessionFile,
+		);
+
+		// The live process holds the session claim while the supervisor has given
+		// up on it, so the session is unreachable and unreclaimable. Recreating it
+		// must stop that worker and relaunch rather than refuse forever.
+		const recreated = await client.request(
+			{
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			},
+			30_000,
+		);
+		if (!recreated.success) {
+			throw new Error(`Recreating the session held by the failed worker was refused: ${recreated.error}`);
+		}
+		const recreatedSummary = requireSummary(recreated.data);
+		expect(recreatedSummary.sessionId).toBe(summary.sessionId);
+		expect(recreatedSummary.workerPid).not.toBe(workerPid);
+		expect(recreatedSummary.workerState).toBe("ready");
+		if (recreatedSummary.workerPid) {
+			workerPids.add(recreatedSummary.workerPid);
+		}
+
+		// Reclaim is stop-then-launch: the wedged process must be gone rather than
+		// left running alongside its replacement against the same session file.
+		await waitForProcessGone(workerPid);
+		workerPids.delete(workerPid);
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
+	});
+
+	it("recreates a session whose failed worker process is already gone", {
+		tags: ["process-stress"],
+		timeout: 90_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-failed-dead-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "reclaim me too", timestamp: 1 });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+		const { client, summary, workerPid } = await wedgeFailedWorkerWithLiveProcess(
+			agentDir,
+			projectDir,
+			sessionDir,
+			socketPath,
+			sessionFile,
+		);
+
+		process.kill(workerPid, "SIGKILL");
+		await waitForProcessGone(workerPid);
+		workerPids.delete(workerPid);
+
+		const recreated = await client.request(
+			{
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			},
+			30_000,
+		);
+		if (!recreated.success) {
+			throw new Error(`Recreating the session held by the failed worker was refused: ${recreated.error}`);
+		}
+		const recreatedSummary = requireSummary(recreated.data);
+		expect(recreatedSummary.sessionId).toBe(summary.sessionId);
+		expect(recreatedSummary.workerState).toBe("ready");
+		if (recreatedSummary.workerPid) {
+			workerPids.add(recreatedSummary.workerPid);
+		}
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
+	});
+
 	it("does not resurrect an intentionally stopped root when the supervisor dies during kill", {
 		tags: ["process-stress"],
 		timeout: 30_000,
@@ -1469,6 +1678,339 @@ describe("daemon supervisor resident workers", () => {
 		expect(countWorkerDescriptors(agentDir)).toBe(0);
 		expect((await readSessionInfo(sessionFile))?.state).toEqual({ status: "archived" });
 		expect(cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({ status: "cancelled" });
+
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
+		await waitForSocketGone(socketPath);
+	});
+
+	it("relaunches a resident root whose worker died with the previous daemon, heartbeat intact", {
+		timeout: 60_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-restart-resume-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "survive the restart", timestamp: 1 });
+		sessionManager.appendSessionState({ status: "active" });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, firstSupervisor);
+		const firstSupervisorPid = client.hello?.supervisorPid;
+		if (!firstSupervisorPid) {
+			throw new Error("Daemon hello did not expose its supervisor pid");
+		}
+		const created = await client.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) {
+			throw new Error(created.error);
+		}
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) {
+			throw new Error("Resident worker did not expose its pid");
+		}
+		workerPids.add(summary.workerPid);
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const heartbeatResponse = await client.request({
+			type: "heartbeat_set",
+			activeSessionId,
+			schedule: "every 1h",
+			prompt: "continue old work",
+		});
+		if (!heartbeatResponse.success || !heartbeatResponse.data || typeof heartbeatResponse.data !== "object") {
+			throw new Error(heartbeatResponse.success ? "Heartbeat response was missing data" : heartbeatResponse.error);
+		}
+		const heartbeat = (heartbeatResponse.data as { heartbeat: { id: string } }).heartbeat;
+		const cronStore = AgentCronJobStore.forSessionArtifacts();
+		cronStore.registerSessionArtifact(summary.sessionId, sessionManager.getSessionArtifactDir()!);
+
+		// The daemon dies without ceremony and takes its worker with it.
+		process.kill(firstSupervisorPid, "SIGKILL");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		client.close();
+		process.kill(summary.workerPid, "SIGKILL");
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		expect(countWorkerDescriptors(agentDir)).toBe(1);
+
+		const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const replacementClient = await connectEventually(socketPath, replacementSupervisor);
+		const listed = await replacementClient.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		const resumed = requireSessionList(listed.success ? listed.data : undefined).find(
+			(session) => session.sessionFile === sessionFile,
+		);
+		if (!resumed?.workerPid) {
+			throw new Error(`Resident root was not relaunched after restart\n${readDaemonLogs(agentDir)}`);
+		}
+		workerPids.add(resumed.workerPid);
+		expect(resumed.workerPid).not.toBe(summary.workerPid);
+		expect(resumed.workerState).toBe("ready");
+		expect(resumed.activeSessionId ?? resumed.id).toBe(activeSessionId);
+
+		const descriptor = readWorkerDescriptor(agentDir);
+		expect(descriptor.pid).toBe(resumed.workerPid);
+		expect(descriptor.lifecycle).toBe("ready");
+
+		const restoredHeartbeat = await replacementClient.request({
+			type: "heartbeat_get",
+			activeSessionId: resumed.activeSessionId ?? resumed.id,
+		});
+		if (!restoredHeartbeat.success) {
+			throw new Error(restoredHeartbeat.error);
+		}
+		expect((restoredHeartbeat.data as { heartbeat: { id: string; status: string } | null }).heartbeat).toMatchObject({
+			id: heartbeat.id,
+			status: "active",
+		});
+		expect(cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({ status: "active" });
+		expect((await readSessionInfo(sessionFile))?.state).toEqual({ status: "active" });
+
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
+		await waitForSocketGone(socketPath);
+	});
+
+	it("leaves failed and archived roots down after a daemon restart", { timeout: 60_000 }, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-restart-skip-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionFiles = Array.from({ length: 2 }, (_, index) => {
+			const manager = SessionManager.create(projectDir, sessionDir);
+			manager.appendMessage({ role: "user", content: `stay down ${index}`, timestamp: index + 1 });
+			manager.appendSessionState({ status: "active" });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) {
+				throw new Error("Fixture session did not persist");
+			}
+			return sessionFile;
+		});
+		const [failedSessionFile, archivedSessionFile] = sessionFiles;
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, firstSupervisor);
+		const firstSupervisorPid = client.hello?.supervisorPid;
+		if (!firstSupervisorPid) {
+			throw new Error("Daemon hello did not expose its supervisor pid");
+		}
+		const summaries = await Promise.all(
+			sessionFiles.map(async (sessionPath) => {
+				const created = await client.request({
+					type: "create",
+					sessionPath,
+					config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+				});
+				if (!created.success) {
+					throw new Error(created.error);
+				}
+				return requireSummary(created.data);
+			}),
+		);
+		for (const summary of summaries) {
+			if (!summary.workerPid) {
+				throw new Error("Resident worker did not expose its pid");
+			}
+			workerPids.add(summary.workerPid);
+		}
+
+		process.kill(firstSupervisorPid, "SIGKILL");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		client.close();
+		for (const summary of summaries) {
+			process.kill(summary.workerPid!, "SIGKILL");
+			await waitForProcessGone(summary.workerPid!);
+			workerPids.delete(summary.workerPid!);
+		}
+
+		const failedEntry = readWorkerDescriptorEntries(agentDir).find(
+			(entry) => entry.descriptor.sessionFile === failedSessionFile,
+		);
+		if (!failedEntry) {
+			throw new Error("Failed fixture descriptor was not persisted");
+		}
+		writeFileSync(
+			failedEntry.path,
+			`${JSON.stringify({ ...failedEntry.descriptor, lifecycle: "failed" }, null, 2)}\n`,
+		);
+		SessionManager.open(archivedSessionFile).appendSessionState({ status: "archived" });
+
+		const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const replacementClient = await connectEventually(socketPath, replacementSupervisor);
+		const listed = await replacementClient.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		const relaunched = requireSessionList(listed.success ? listed.data : undefined).filter(
+			(session) => sessionFiles.includes(session.sessionFile ?? "") && session.workerPid,
+		);
+		expect(relaunched).toEqual([]);
+
+		const entries = readWorkerDescriptorEntries(agentDir);
+		expect(entries).toHaveLength(2);
+		for (const entry of entries) {
+			expect(entry.descriptor.lifecycle).toBe("failed");
+		}
+		// Skip reasons never persist in descriptors (free-form runtime text is
+		// kept out of them); the startup log is the durable record of why.
+		const daemonLogs = readDaemonLogs(agentDir);
+		expect(daemonLogs).toMatch(/Not resuming resident worker .*: the previous daemon had marked it failed/);
+		expect(daemonLogs).toMatch(/Not resuming resident worker .*: its session is no longer marked daemon-resident/);
+
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
+		await waitForSocketGone(socketPath);
+	});
+
+	it("leaves resident roots down after a daemon restart when resume is disabled in settings", {
+		timeout: 45_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-restart-optout-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "cold starts please", timestamp: 1 });
+		sessionManager.appendSessionState({ status: "active" });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, firstSupervisor);
+		const firstSupervisorPid = client.hello?.supervisorPid;
+		if (!firstSupervisorPid) {
+			throw new Error("Daemon hello did not expose its supervisor pid");
+		}
+		const created = await client.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) {
+			throw new Error(created.error);
+		}
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) {
+			throw new Error("Resident worker did not expose its pid");
+		}
+		workerPids.add(summary.workerPid);
+
+		process.kill(firstSupervisorPid, "SIGKILL");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		client.close();
+		process.kill(summary.workerPid, "SIGKILL");
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ resumeSessionsOnRestart: false })}\n`);
+
+		const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const replacementClient = await connectEventually(socketPath, replacementSupervisor);
+		const listed = await replacementClient.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		const resumed = requireSessionList(listed.success ? listed.data : undefined).find(
+			(session) => session.sessionFile === sessionFile && session.workerPid,
+		);
+		expect(resumed).toBeUndefined();
+		expect(readWorkerDescriptor(agentDir).lifecycle).toBe("failed");
+		expect(readDaemonLogs(agentDir)).toMatch(
+			/Not resuming resident worker .*: resumeSessionsOnRestart is disabled in settings/,
+		);
+
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
+		await waitForSocketGone(socketPath);
+	});
+
+	it("stops and resumes a wedged live worker at startup instead of leaving it failed", {
+		tags: ["process-stress"],
+		timeout: 90_000,
+	}, async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-restart-wedged-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "wedged but wanted", timestamp: 1 });
+		sessionManager.appendSessionState({ status: "active" });
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const firstClient = await connectEventually(socketPath, firstSupervisor);
+		const firstSupervisorPid = firstClient.hello?.supervisorPid;
+		if (!firstSupervisorPid) {
+			throw new Error("Daemon hello did not expose its supervisor pid");
+		}
+		const created = await firstClient.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) {
+			throw new Error(created.error);
+		}
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid) {
+			throw new Error("Resident worker did not expose its pid");
+		}
+		workerPids.add(summary.workerPid);
+
+		process.kill(summary.workerPid, "SIGSTOP");
+		process.kill(firstSupervisorPid, "SIGKILL");
+		await waitForExit(firstSupervisor);
+		children.delete(firstSupervisor);
+		firstClient.close();
+
+		// Adoption gives the unreachable worker three reconnect attempts, then
+		// verifies its identity, stops it, and relaunches the session.
+		const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const replacementClient = await connectEventually(socketPath, replacementSupervisor, 60_000);
+		const listed = await replacementClient.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		const resumed = requireSessionList(listed.success ? listed.data : undefined).find(
+			(session) => session.sessionFile === sessionFile,
+		);
+		if (!resumed?.workerPid) {
+			throw new Error(`Wedged resident root was not relaunched after restart\n${readDaemonLogs(agentDir)}`);
+		}
+		workerPids.add(resumed.workerPid);
+		expect(resumed.workerPid).not.toBe(summary.workerPid);
+		expect(resumed.workerState).toBe("ready");
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
 
 		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();

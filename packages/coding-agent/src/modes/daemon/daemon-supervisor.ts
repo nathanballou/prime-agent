@@ -287,6 +287,8 @@ interface ResidentWorker {
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
 	transientCreateCommand?: DaemonCreateCommand;
+	/** Lifecycle persisted by the previous daemon generation; present only until startup adoption settles. */
+	adoptedLifecycle?: DaemonWorkerLifecycle;
 	stopFinalization?: Promise<void>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
@@ -741,6 +743,11 @@ export class DaemonSupervisor {
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
+			// Restart resume is a startup-only affordance; a worker that dies after
+			// this point needs fresh client context again, exactly as before.
+			for (const worker of workersToAdopt) {
+				worker.adoptedLifecycle = undefined;
+			}
 			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
@@ -993,6 +1000,7 @@ export class DaemonSupervisor {
 					continue;
 				}
 				descriptor.supervisorSocketPath = normalizeSocketPath(descriptor.supervisorSocketPath);
+				const adoptedLifecycle = descriptor.lifecycle;
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
@@ -1007,6 +1015,7 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: durableDescriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
+					adoptedLifecycle,
 				};
 				this.persistWorker(worker);
 				this.workers.set(durableDescriptor.workerId, worker);
@@ -2286,10 +2295,7 @@ export class DaemonSupervisor {
 		const ownerClientId = command.lifecycle === "client_owned" ? clientId : undefined;
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
-			if (
-				activeMatches.length === 1 &&
-				!(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker, command.launchEnv !== undefined))
-			) {
+			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
 				return this.reuseWorkerForCreate(
 					activeMatches[0]!.worker,
 					ownerClientId,
@@ -2306,7 +2312,7 @@ export class DaemonSupervisor {
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
-			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
+			if (existing && !(await this.reclaimStaleWorkerRegistration(existing))) {
 				return this.reuseWorkerForCreate(existing, ownerClientId, sessionPath, command.config?.cwd);
 			}
 		}
@@ -2352,7 +2358,8 @@ export class DaemonSupervisor {
 	): ResidentWorker {
 		if (worker.descriptor.lifecycle === "failed") {
 			throw new Error(
-				`Session "${sessionPath}" is registered to a failed worker that could not be safely reclaimed`,
+				`Session "${sessionPath}" is registered to failed worker ${worker.descriptor.workerId}, whose ` +
+					`process could not be reclaimed automatically; terminate pid ${worker.descriptor.pid} to release the session`,
 			);
 		}
 		if (worker.descriptor.ownerClientId === ownerClientId) {
@@ -2373,11 +2380,12 @@ export class DaemonSupervisor {
 	/**
 	 * A stopping worker whose process already died can strand its registration
 	 * (for example when the stop timed out and its finalization was interrupted
-	 * by a supervisor restart). Such a registration would block reopening the
-	 * saved transcript forever, so complete the interrupted stop and let the
-	 * caller launch a fresh worker for the saved session.
+	 * by a supervisor restart), and so can a worker the supervisor gave up on
+	 * while its process kept running. Such a registration would block reopening
+	 * the saved transcript forever, so finish the stop the registration implies
+	 * and let the caller launch a fresh worker for the saved session.
 	 */
-	private async reclaimStaleWorkerRegistration(worker: ResidentWorker, freshCreate = false): Promise<boolean> {
+	private async reclaimStaleWorkerRegistration(worker: ResidentWorker): Promise<boolean> {
 		if (worker.client !== undefined || worker.recovery !== undefined) {
 			return false;
 		}
@@ -2387,8 +2395,19 @@ export class DaemonSupervisor {
 			}
 			const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
 			if (identity === "current") {
-				if (!freshCreate || !worker.descriptor.processStartId) return false;
-				await this.stopWorker(worker, true, true);
+				// The supervisor has already given up on this worker, so its live
+				// process only holds the session file hostage: the session is
+				// unreachable through the API and no create can reopen it. Reclaim
+				// is stop-then-launch, never launch-alongside, so the identified
+				// process must be gone before the caller relaunches.
+				try {
+					await this.stopWorker(worker, true, true);
+				} catch (error) {
+					throw new Error(
+						`Failed session worker ${worker.descriptor.workerId} could not be stopped to release its ` +
+							`session; terminate pid ${worker.descriptor.pid} to recover: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
 				return true;
 			}
 			if (identity !== "gone" && identity !== "replaced") {
@@ -3186,11 +3205,19 @@ export class DaemonSupervisor {
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
-					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
-					if (!recoveryCommand || !worker.launchEnv) {
+					let recoveryCommand: DaemonCreateCommand | undefined;
+					let recoveryRefusal = "Waiting for a client with fresh runtime context";
+					if (worker.descriptor.ownerClientId) {
+						recoveryCommand = worker.launchEnv ? worker.transientCreateCommand : undefined;
+					} else {
+						const resume = await this.residentRestartResume(worker);
+						recoveryCommand = resume.command;
+						if (resume.skipReason) recoveryRefusal = resume.skipReason;
+					}
+					if (!recoveryCommand) {
 						await this.recoverUncertainWorkerOperations(worker, false);
 						worker.descriptor.lifecycle = "failed";
-						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
+						worker.descriptor.lastError = recoveryRefusal;
 						this.persistWorker(worker);
 						await this.syncAgentPeers().catch(() => undefined);
 						return;
@@ -3233,6 +3260,57 @@ export class DaemonSupervisor {
 			worker.recovery = undefined;
 		});
 		return worker.recovery;
+	}
+
+	/**
+	 * The relaunch decision for a resident root whose process is gone. Only
+	 * descriptors adopted from a previous daemon generation qualify: roots the
+	 * previous daemon marked failed stay down, operators can disable resume
+	 * globally, and a session whose file no longer carries the daemon-resident
+	 * marker (archived on kill/complete/explicit shutdown) is never resurrected.
+	 * Deliberate stops and idle evictions never reach this point — they
+	 * tombstone or delete the descriptor before the process dies.
+	 */
+	private async residentRestartResume(
+		worker: ResidentWorker,
+	): Promise<{ command?: DaemonCreateCommand; skipReason?: string }> {
+		if (worker.adoptedLifecycle === undefined) {
+			return {};
+		}
+		const workerId = worker.descriptor.workerId;
+		const skip = (reason: string): { skipReason: string } => {
+			this.log(`Not resuming resident worker ${workerId} after daemon restart: ${reason}`);
+			return { skipReason: `Not resumed after daemon restart: ${reason}` };
+		};
+		if (worker.adoptedLifecycle === "failed") {
+			return skip("the previous daemon had marked it failed");
+		}
+		if (!this.settingsManager.getResumeSessionsOnRestart()) {
+			return skip("resumeSessionsOnRestart is disabled in settings");
+		}
+		const sessionPath = worker.descriptor.sessionFile ?? worker.descriptor.createCommand.sessionPath;
+		if (!sessionPath) {
+			return skip("it has no persisted session file");
+		}
+		const info = await readSessionInfo(sessionPath).catch(() => null);
+		if (!info) {
+			return skip(`its session file could not be read: ${sessionPath}`);
+		}
+		if (info.state?.status !== "active") {
+			return skip(`its session is no longer marked daemon-resident: ${sessionPath}`);
+		}
+		this.log(`Resuming resident session ${sessionPath} for worker ${workerId} after daemon restart`);
+		const config: AgentSessionRuntimeConfig = {
+			...(worker.descriptor.sessionDir !== undefined ? { sessionDir: worker.descriptor.sessionDir } : {}),
+			...(worker.descriptor.telemetryDisabled ? { telemetryDisabled: true as const } : {}),
+		};
+		return {
+			command: {
+				type: "create",
+				sessionPath,
+				...(Object.keys(config).length > 0 ? { config } : {}),
+			},
+		};
 	}
 
 	private isWorkerRecoveryCancelled(worker: ResidentWorker): boolean {
