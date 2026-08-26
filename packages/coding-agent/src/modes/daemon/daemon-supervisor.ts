@@ -2286,10 +2286,7 @@ export class DaemonSupervisor {
 		const ownerClientId = command.lifecycle === "client_owned" ? clientId : undefined;
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
-			if (
-				activeMatches.length === 1 &&
-				!(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker, command.launchEnv !== undefined))
-			) {
+			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
 				return this.reuseWorkerForCreate(
 					activeMatches[0]!.worker,
 					ownerClientId,
@@ -2306,7 +2303,7 @@ export class DaemonSupervisor {
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
-			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
+			if (existing && !(await this.reclaimStaleWorkerRegistration(existing))) {
 				return this.reuseWorkerForCreate(existing, ownerClientId, sessionPath, command.config?.cwd);
 			}
 		}
@@ -2352,7 +2349,8 @@ export class DaemonSupervisor {
 	): ResidentWorker {
 		if (worker.descriptor.lifecycle === "failed") {
 			throw new Error(
-				`Session "${sessionPath}" is registered to a failed worker that could not be safely reclaimed`,
+				`Session "${sessionPath}" is registered to failed worker ${worker.descriptor.workerId}, whose ` +
+					`process could not be reclaimed automatically; terminate pid ${worker.descriptor.pid} to release the session`,
 			);
 		}
 		if (worker.descriptor.ownerClientId === ownerClientId) {
@@ -2373,11 +2371,12 @@ export class DaemonSupervisor {
 	/**
 	 * A stopping worker whose process already died can strand its registration
 	 * (for example when the stop timed out and its finalization was interrupted
-	 * by a supervisor restart). Such a registration would block reopening the
-	 * saved transcript forever, so complete the interrupted stop and let the
-	 * caller launch a fresh worker for the saved session.
+	 * by a supervisor restart), and so can a worker the supervisor gave up on
+	 * while its process kept running. Such a registration would block reopening
+	 * the saved transcript forever, so finish the stop the registration implies
+	 * and let the caller launch a fresh worker for the saved session.
 	 */
-	private async reclaimStaleWorkerRegistration(worker: ResidentWorker, freshCreate = false): Promise<boolean> {
+	private async reclaimStaleWorkerRegistration(worker: ResidentWorker): Promise<boolean> {
 		if (worker.client !== undefined || worker.recovery !== undefined) {
 			return false;
 		}
@@ -2387,8 +2386,19 @@ export class DaemonSupervisor {
 			}
 			const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
 			if (identity === "current") {
-				if (!freshCreate || !worker.descriptor.processStartId) return false;
-				await this.stopWorker(worker, true, true);
+				// The supervisor has already given up on this worker, so its live
+				// process only holds the session file hostage: the session is
+				// unreachable through the API and no create can reopen it. Reclaim
+				// is stop-then-launch, never launch-alongside, so the identified
+				// process must be gone before the caller relaunches.
+				try {
+					await this.stopWorker(worker, true, true);
+				} catch (error) {
+					throw new Error(
+						`Failed session worker ${worker.descriptor.workerId} could not be stopped to release its ` +
+							`session; terminate pid ${worker.descriptor.pid} to recover: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
 				return true;
 			}
 			if (identity !== "gone" && identity !== "replaced") {
