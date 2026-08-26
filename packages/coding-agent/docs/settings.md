@@ -201,8 +201,9 @@ Normally the package manager's global modules location is queried using `root -g
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+| `resumeSessionsOnRestart` | boolean | `true` | Relaunch resident sessions lost to a daemon restart. Set to `false` for cold starts; sessions the previous daemon marked failed, deliberately stopped, idle-evicted, or archived stay down either way. |
 
-`idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
+`idleEvictionMinutes` and `resumeSessionsOnRestart` are global daemon policies and are read only from `~/.prime/agent/settings.json`. Set `idleEvictionMinutes` to a positive number to configure the idle threshold.
 
 ### Sessions
 

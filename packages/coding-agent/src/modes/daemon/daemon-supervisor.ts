@@ -287,6 +287,8 @@ interface ResidentWorker {
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
 	transientCreateCommand?: DaemonCreateCommand;
+	/** Lifecycle persisted by the previous daemon generation; present only until startup adoption settles. */
+	adoptedLifecycle?: DaemonWorkerLifecycle;
 	stopFinalization?: Promise<void>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
@@ -741,6 +743,11 @@ export class DaemonSupervisor {
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
+			// Restart resume is a startup-only affordance; a worker that dies after
+			// this point needs fresh client context again, exactly as before.
+			for (const worker of workersToAdopt) {
+				worker.adoptedLifecycle = undefined;
+			}
 			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
@@ -993,6 +1000,7 @@ export class DaemonSupervisor {
 					continue;
 				}
 				descriptor.supervisorSocketPath = normalizeSocketPath(descriptor.supervisorSocketPath);
+				const adoptedLifecycle = descriptor.lifecycle;
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
@@ -1007,6 +1015,7 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: durableDescriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
+					adoptedLifecycle,
 				};
 				this.persistWorker(worker);
 				this.workers.set(durableDescriptor.workerId, worker);
@@ -3196,11 +3205,19 @@ export class DaemonSupervisor {
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
-					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
-					if (!recoveryCommand || !worker.launchEnv) {
+					let recoveryCommand: DaemonCreateCommand | undefined;
+					let recoveryRefusal = "Waiting for a client with fresh runtime context";
+					if (worker.descriptor.ownerClientId) {
+						recoveryCommand = worker.launchEnv ? worker.transientCreateCommand : undefined;
+					} else {
+						const resume = await this.residentRestartResume(worker);
+						recoveryCommand = resume.command;
+						if (resume.skipReason) recoveryRefusal = resume.skipReason;
+					}
+					if (!recoveryCommand) {
 						await this.recoverUncertainWorkerOperations(worker, false);
 						worker.descriptor.lifecycle = "failed";
-						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
+						worker.descriptor.lastError = recoveryRefusal;
 						this.persistWorker(worker);
 						await this.syncAgentPeers().catch(() => undefined);
 						return;
@@ -3243,6 +3260,57 @@ export class DaemonSupervisor {
 			worker.recovery = undefined;
 		});
 		return worker.recovery;
+	}
+
+	/**
+	 * The relaunch decision for a resident root whose process is gone. Only
+	 * descriptors adopted from a previous daemon generation qualify: roots the
+	 * previous daemon marked failed stay down, operators can disable resume
+	 * globally, and a session whose file no longer carries the daemon-resident
+	 * marker (archived on kill/complete/explicit shutdown) is never resurrected.
+	 * Deliberate stops and idle evictions never reach this point — they
+	 * tombstone or delete the descriptor before the process dies.
+	 */
+	private async residentRestartResume(
+		worker: ResidentWorker,
+	): Promise<{ command?: DaemonCreateCommand; skipReason?: string }> {
+		if (worker.adoptedLifecycle === undefined) {
+			return {};
+		}
+		const workerId = worker.descriptor.workerId;
+		const skip = (reason: string): { skipReason: string } => {
+			this.log(`Not resuming resident worker ${workerId} after daemon restart: ${reason}`);
+			return { skipReason: `Not resumed after daemon restart: ${reason}` };
+		};
+		if (worker.adoptedLifecycle === "failed") {
+			return skip("the previous daemon had marked it failed");
+		}
+		if (!this.settingsManager.getResumeSessionsOnRestart()) {
+			return skip("resumeSessionsOnRestart is disabled in settings");
+		}
+		const sessionPath = worker.descriptor.sessionFile ?? worker.descriptor.createCommand.sessionPath;
+		if (!sessionPath) {
+			return skip("it has no persisted session file");
+		}
+		const info = await readSessionInfo(sessionPath).catch(() => null);
+		if (!info) {
+			return skip(`its session file could not be read: ${sessionPath}`);
+		}
+		if (info.state?.status !== "active") {
+			return skip(`its session is no longer marked daemon-resident: ${sessionPath}`);
+		}
+		this.log(`Resuming resident session ${sessionPath} for worker ${workerId} after daemon restart`);
+		const config: AgentSessionRuntimeConfig = {
+			...(worker.descriptor.sessionDir !== undefined ? { sessionDir: worker.descriptor.sessionDir } : {}),
+			...(worker.descriptor.telemetryDisabled ? { telemetryDisabled: true as const } : {}),
+		};
+		return {
+			command: {
+				type: "create",
+				sessionPath,
+				...(Object.keys(config).length > 0 ? { config } : {}),
+			},
+		};
 	}
 
 	private isWorkerRecoveryCancelled(worker: ResidentWorker): boolean {

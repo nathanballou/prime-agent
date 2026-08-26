@@ -137,6 +137,7 @@ export interface Settings {
 	defaultServiceTier?: ServiceTier;
 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
 	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
+	resumeSessionsOnRestart?: boolean; // relaunch resident sessions lost to a daemon restart; default: true
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -799,6 +800,10 @@ export class SettingsManager {
 		this.globalSettings.idleEvictionMinutes = value;
 		this.markModified("idleEvictionMinutes");
 		this.save();
+	}
+
+	getResumeSessionsOnRestart(): boolean {
+		return this.globalSettings.resumeSessionsOnRestart !== false;
 	}
 
 	getTransport(): TransportSetting {
