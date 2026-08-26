@@ -9,7 +9,11 @@ import type {
 	WorkflowApprovalSecretIssuance,
 	WorkflowApprovalStore,
 } from "../src/core/workflow/approvals.js";
-import { approvalBindingDigest, createDurableApprovalManager } from "../src/core/workflow/approvals.js";
+import {
+	approvalBindingDigest,
+	createDurableApprovalManager,
+	WorkflowApprovalResponseBindingError,
+} from "../src/core/workflow/approvals.js";
 import type {
 	WorkflowApprovalConsumptionResult,
 	WorkflowApprovalRequest,
@@ -330,6 +334,78 @@ describe("durable workflow approvals", () => {
 	});
 });
 
+describe("approval response binding failures name their cause", () => {
+	it("names expiry and the deadline when the credential expired", async () => {
+		const fixture = createApprovalManagerFixture();
+		const request = await fixture.manager.createRequest(createApprovalInput());
+		const response = createInteractiveResponse(request, "approve", "one-use-secret");
+		fixture.setTrustedClockTime("2030-01-01T00:02:01.000Z");
+
+		const failure = await fixture.manager.consumeInteractive(response).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(WorkflowApprovalResponseBindingError);
+		expect((failure as WorkflowApprovalResponseBindingError).binding).toBe("expired");
+		expect((failure as Error).message).toMatch(/expired/i);
+		expect((failure as Error).message).toContain(request.expiresAt);
+		expect(fixture.getConsumed()).toBeNull();
+	});
+
+	it("names the expected response sequence on a sequence mismatch", async () => {
+		const fixture = createApprovalManagerFixture();
+		const request = await fixture.manager.createRequest(createApprovalInput());
+		const response = createInteractiveResponse(request, "approve", "one-use-secret");
+
+		const failure = await fixture.manager.consumeInteractive({ ...response, responseSequence: 7 }).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(WorkflowApprovalResponseBindingError);
+		expect((failure as WorkflowApprovalResponseBindingError).binding).toBe("sequence");
+		expect((failure as Error).message).toMatch(/sequence/i);
+		expect((failure as Error).message).toContain(String(request.expectedResponseSequence));
+		expect(fixture.getConsumed()).toBeNull();
+	});
+
+	it("names the principal on a foreign-principal response", async () => {
+		const fixture = createApprovalManagerFixture();
+		const request = await fixture.manager.createRequest(createApprovalInput());
+		const response = createInteractiveResponse(request, "approve", "one-use-secret");
+		const foreignResponse = {
+			...response,
+			trustedPrincipal: { kind: "interactive_ui" as const, principalId: "user-2", credentialDigest: "credential-2" },
+		};
+
+		const failure = await fixture.manager.consumeInteractive(foreignResponse).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect(failure).toBeInstanceOf(WorkflowApprovalResponseBindingError);
+		expect((failure as WorkflowApprovalResponseBindingError).binding).toBe("principal");
+		expect((failure as Error).message).toMatch(/principal/i);
+		expect(fixture.getConsumed()).toBeNull();
+	});
+
+	it("names the drifted digest field on a state mismatch", async () => {
+		const fixture = createApprovalManagerFixture();
+		const request = await fixture.manager.createRequest(createApprovalInput());
+		const response = createInteractiveResponse(request, "approve", "one-use-secret");
+
+		const failure = await fixture.manager
+			.consumeInteractive({ ...response, stateDigest: "state-drifted", configDigest: "config-drifted" })
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		expect(failure).toBeInstanceOf(WorkflowApprovalResponseBindingError);
+		expect((failure as WorkflowApprovalResponseBindingError).binding).toBe("drift");
+		expect((failure as Error).message).toContain("stateDigest");
+		expect((failure as Error).message).toContain("configDigest");
+		expect(fixture.getConsumed()).toBeNull();
+	});
+});
+
 interface ManagerFixture {
 	manager: WorkflowApprovalManagerWithOutcome;
 	store: WorkflowApprovalStore;
@@ -339,11 +415,13 @@ interface ManagerFixture {
 	getReconcileCalls(): number;
 	getLastResumeTransition(): WorkflowApprovalResumeTransition | null;
 	setHead(head: { stateDigest: string; epochRef: WorkflowEpochRef; headDigest: string; revision: number }): void;
+	setTrustedClockTime(issuedAt: string): void;
 }
 
 function createApprovalManagerFixture(failDelivery = false): ManagerFixture {
 	const keyPair = generateKeyPairSync("ed25519");
 	const fixture = createApprovalStoreFixture();
+	let trustedClockIssuedAt = "2030-01-01T00:00:01.000Z";
 	const currentDecisionRefs = createDecisionRefs();
 	const dependencies = (store: WorkflowApprovalStore) => ({
 		store,
@@ -432,8 +510,8 @@ function createApprovalManagerFixture(failDelivery = false): ManagerFixture {
 						sizeBytes: 1,
 						sourceEventSequence: 0,
 					},
-					issuedAt: "2030-01-01T00:00:01.000Z",
-					validUntil: "2030-01-01T00:05:00.000Z",
+					issuedAt: trustedClockIssuedAt,
+					validUntil: new Date(Date.parse(trustedClockIssuedAt) + 300_000).toISOString(),
 					keyId: "approval-clock-key",
 					signature: "approval-clock-signature",
 					stateDigest: "state",
@@ -453,6 +531,9 @@ function createApprovalManagerFixture(failDelivery = false): ManagerFixture {
 		getReconcileCalls: fixture.getReconcileCalls,
 		getLastResumeTransition: fixture.getLastResumeTransition,
 		setHead: fixture.setHead,
+		setTrustedClockTime: (issuedAt: string) => {
+			trustedClockIssuedAt = issuedAt;
+		},
 	};
 }
 
