@@ -135,7 +135,8 @@ export type WorkflowCommand =
 	  }
 	| { kind: "pause"; reason: string }
 	| { kind: "resume"; note?: string }
-	| { kind: "cancel"; reason?: string };
+	| { kind: "cancel"; reason?: string }
+	| { kind: "reject"; reason?: string };
 
 export interface WorkflowShell {
 	execute(command: WorkflowCommand): Promise<WorkflowShellStatus>;

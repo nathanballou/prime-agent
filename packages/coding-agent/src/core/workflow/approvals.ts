@@ -19,6 +19,19 @@ import { WorkflowStore } from "./reducer.js";
 
 export type WorkflowApprovalAction = "approve" | "decline" | "cancel" | "revise" | "restart";
 
+export type WorkflowApprovalResponseBindingFailure = "drift" | "principal" | "sequence" | "clock" | "expired";
+
+/** Names which binding check refused an approval response, so callers can react per cause. */
+export class WorkflowApprovalResponseBindingError extends Error {
+	readonly binding: WorkflowApprovalResponseBindingFailure;
+
+	constructor(message: string, binding: WorkflowApprovalResponseBindingFailure) {
+		super(message);
+		this.name = "WorkflowApprovalResponseBindingError";
+		this.binding = binding;
+	}
+}
+
 export type WorkflowApprovalHostOutcome =
 	| (WorkflowApprovalHostOutcomeBase & {
 			action: "approve";
@@ -549,28 +562,57 @@ function assertApprovalResponse(
 		decisionRoles: request.decisionRoles,
 		expectedEpoch: { storeEpoch: request.storeEpoch, coordinatorEpoch: request.coordinatorEpoch },
 	});
+	const drifted = (
+		[
+			["approvalRequestId", response.approvalRequestId !== request.approvalRequestId],
+			["workflowId", response.workflowId !== request.workflowId],
+			["headDigest", response.headDigest !== request.headDigest],
+			["stateDigest", response.stateDigest !== request.stateDigest],
+			["configDigest", response.configDigest !== request.configDigest],
+			["profileDigest", response.profileDigest !== request.profileDigest],
+			["artifactDigest", response.artifactDigest !== request.artifactDigest],
+			["storeEpoch", response.storeEpoch !== request.storeEpoch],
+			["coordinatorEpoch", response.coordinatorEpoch !== request.coordinatorEpoch],
+			["decisionRef", digestObject(response.decisionRef) !== digestObject(request.decisionRef)],
+			["decisionRefs", digestObject(response.decisionRefs) !== digestObject(request.decisionRefs)],
+			["decisionRoles", digestObject(response.decisionRoles) !== digestObject(request.decisionRoles)],
+		] as const
+	)
+		.filter(([, mismatch]) => mismatch)
+		.map(([field]) => field);
+	if (drifted.length > 0) {
+		throw new WorkflowApprovalResponseBindingError(
+			`Workflow approval response does not match the pending request: ${drifted.join(", ")} drifted.`,
+			"drift",
+		);
+	}
 	if (
-		response.approvalRequestId !== request.approvalRequestId ||
-		response.workflowId !== request.workflowId ||
-		response.headDigest !== request.headDigest ||
-		response.stateDigest !== request.stateDigest ||
-		response.configDigest !== request.configDigest ||
-		response.profileDigest !== request.profileDigest ||
-		response.artifactDigest !== request.artifactDigest ||
-		response.responseSequence !== request.expectedResponseSequence ||
-		response.storeEpoch !== request.storeEpoch ||
-		response.coordinatorEpoch !== request.coordinatorEpoch ||
 		response.clientSessionId !== clientSessionId ||
 		!samePrincipal(response.trustedPrincipal, principal) ||
-		!samePrincipal(response.trustedPrincipal, request.trustedPrincipal) ||
-		digestObject(response.decisionRef) !== digestObject(request.decisionRef) ||
-		digestObject(response.decisionRefs) !== digestObject(request.decisionRefs) ||
-		digestObject(response.decisionRoles) !== digestObject(request.decisionRoles) ||
-		!Number.isFinite(Date.parse(trustedNow)) ||
-		!Number.isFinite(Date.parse(request.expiresAt)) ||
-		Date.parse(trustedNow) >= Date.parse(request.expiresAt)
+		!samePrincipal(response.trustedPrincipal, request.trustedPrincipal)
 	) {
-		throw new Error("Workflow approval response is not bound to the pending request.");
+		throw new WorkflowApprovalResponseBindingError(
+			"Workflow approval response principal or client session does not match the pending request.",
+			"principal",
+		);
+	}
+	if (response.responseSequence !== request.expectedResponseSequence) {
+		throw new WorkflowApprovalResponseBindingError(
+			`Workflow approval response sequence ${response.responseSequence} does not match the pending request (expected ${request.expectedResponseSequence}).`,
+			"sequence",
+		);
+	}
+	if (!Number.isFinite(Date.parse(trustedNow)) || !Number.isFinite(Date.parse(request.expiresAt))) {
+		throw new WorkflowApprovalResponseBindingError(
+			"Workflow approval trusted clock or request expiry timestamp is invalid.",
+			"clock",
+		);
+	}
+	if (Date.parse(trustedNow) >= Date.parse(request.expiresAt)) {
+		throw new WorkflowApprovalResponseBindingError(
+			`Workflow approval credential expired at ${request.expiresAt}; the pending request can no longer be consumed with it.`,
+			"expired",
+		);
 	}
 	const option = request.options.find((candidate) => candidate.optionId === response.optionId);
 	if (option === undefined) throw new Error("Workflow approval option is not present in the pending request.");

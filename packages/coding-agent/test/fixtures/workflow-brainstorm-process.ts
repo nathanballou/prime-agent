@@ -11,8 +11,8 @@ import { getMessageText } from "../suite/harness.js";
 
 const mode = process.argv[2];
 const rootDir = process.argv[3];
-if ((mode !== "draft" && mode !== "propose") || rootDir === undefined)
-	throw new Error("Usage: workflow-brainstorm-process.ts <draft|propose> <root>");
+if ((mode !== "draft" && mode !== "propose" && mode !== "status" && mode !== "reject") || rootDir === undefined)
+	throw new Error("Usage: workflow-brainstorm-process.ts <draft|propose|status|reject> <root>");
 
 mkdirSync(rootDir, { recursive: true });
 const metadataPath = join(rootDir, "metadata.json");
@@ -179,10 +179,44 @@ async function propose(): Promise<void> {
 			? readdirSync(sourceDirectory).filter((fileName) => /^sha256=[0-9a-f]{64}\.json$/.test(fileName)).length
 			: 0,
 		workflowArtifacts: sessionManager.getSessionArtifactDir(),
+		projection: session.getWorkflowStatusProjection() ?? null,
 	});
 	await session.disposeAsync();
 	faux.unregister();
 	process.exit(0);
 }
 
-await (mode === "draft" ? draft() : propose());
+async function reject(): Promise<void> {
+	const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { sessionFile: string; sessionDir: string };
+	const sessionManager = SessionManager.open(metadata.sessionFile, metadata.sessionDir);
+	const { faux, session } = await createProcessSession(sessionManager);
+	await session.promptAndWait("/workflow reject scope is wrong; brainstorm again with narrower boundaries");
+	const delivery = await readWorkflowCliApprovalDelivery(sessionManager.getSessionArtifactDir()!);
+	writeResult({
+		mode,
+		status: getMessageText(session.messages.at(-1)),
+		workflowStatus: session.getWorkflowStatusProjection()?.status ?? null,
+		approvalCredentialPresent: delivery !== undefined,
+	});
+	await session.disposeAsync();
+	faux.unregister();
+	process.exit(0);
+}
+
+async function status(): Promise<void> {
+	const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { sessionFile: string; sessionDir: string };
+	const sessionManager = SessionManager.open(metadata.sessionFile, metadata.sessionDir);
+	const { faux, session } = await createProcessSession(sessionManager);
+	// Binding the workflow host is what fills the projection after a restart;
+	// /workflow status forces that bind without touching the pending approval.
+	await session.promptAndWait("/workflow status");
+	writeResult({
+		mode,
+		projection: session.getWorkflowStatusProjection() ?? null,
+	});
+	await session.disposeAsync();
+	faux.unregister();
+	process.exit(0);
+}
+
+await (mode === "draft" ? draft() : mode === "propose" ? propose() : mode === "reject" ? reject() : status());

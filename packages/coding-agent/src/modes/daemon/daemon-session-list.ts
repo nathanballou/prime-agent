@@ -156,6 +156,12 @@ export interface DaemonWorkflowSpecializationProjection {
  * principals. The head digest is an immutable journal identity, not an action
  * credential.
  */
+/** One planned task from the sealed proposal; identity and role only, no payload. */
+export interface DaemonWorkflowTaskProjection {
+	readonly taskId: string;
+	readonly role: string;
+}
+
 export interface DaemonWorkflowStatusProjection {
 	readonly workflowId: string | null;
 	readonly status: DaemonWorkflowStatus;
@@ -165,6 +171,10 @@ export interface DaemonWorkflowStatusProjection {
 	readonly blocker: DaemonWorkflowBlockerProjection | null;
 	readonly headDigest: string | null;
 	readonly approvalRequest: DaemonWorkflowApprovalProjection | null;
+	/** Goal objective, so an operator can tell what a pending approval is for. */
+	readonly objective?: string | null;
+	/** Sealed-proposal task list; absent when the session cannot resolve it. */
+	readonly tasks?: readonly DaemonWorkflowTaskProjection[];
 	readonly attempts?: readonly DaemonWorkflowAttemptProjection[];
 	readonly leases?: readonly DaemonWorkflowLeaseProjection[];
 	/** Per-node methodology; absent when the host exposes no task graph. */
@@ -183,6 +193,7 @@ const MAX_DATE_TIMESTAMP_MS = 8.64e15;
 const MAX_WORKFLOW_ATTEMPTS = 128;
 const MAX_WORKFLOW_LEASES = 128;
 const MAX_WORKFLOW_SPECIALIZATIONS = 128;
+const MAX_WORKFLOW_TASKS = 128;
 
 // Lightweight daemon session shape used by list, create, rename, attach, and state responses.
 export interface SessionSummary {
@@ -592,6 +603,12 @@ function cloneWorkflowStatusProjection(projection: DaemonWorkflowStatusProjectio
 					})),
 				}
 			: null,
+		...(projection.objective !== undefined ? { objective: projection.objective } : {}),
+		...(projection.tasks !== undefined
+			? {
+					tasks: projection.tasks.slice(0, MAX_WORKFLOW_TASKS).map(({ taskId, role }) => ({ taskId, role })),
+				}
+			: {}),
 		...(projection.attempts !== undefined
 			? {
 					attempts: projection.attempts.slice(0, MAX_WORKFLOW_ATTEMPTS).map((attempt) => ({

@@ -41,6 +41,8 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"list",
 	"workflow-status",
 	"workflow-watch",
+	"workflow-approve",
+	"workflow-reject",
 	"create",
 	"attach",
 	"detach",
@@ -192,6 +194,12 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				return;
 			case "workflow-watch":
 				await runWorkflowWatch(client, parsed.positionals, parsed.json);
+				return;
+			case "workflow-approve":
+				await runWorkflowRespond(client, parsed.positionals, parsed.json, "approve");
+				return;
+			case "workflow-reject":
+				await runWorkflowRespond(client, parsed.positionals, parsed.json, "reject");
 				return;
 			case "create":
 				await runCreate(client, parsed.positionals, parsed.json);
@@ -827,6 +835,41 @@ async function runWorkflowStatus(client: DaemonClient, args: string[], json: boo
 	console.log(formatWorkflowStatusText(summary));
 }
 
+async function runWorkflowRespond(
+	client: DaemonClient,
+	args: string[],
+	json: boolean,
+	action: "approve" | "reject",
+): Promise<void> {
+	const [selector, ...reasonParts] = args;
+	if (!selector || selector.startsWith("-") || (action === "approve" && reasonParts.length > 0)) {
+		throw new Error(`Usage: prime-agent workflow ${action} <agent>${action === "reject" ? " [reason]" : ""}`);
+	}
+	const summary = selectWorkflowSession(await getWorkflowSessions(client), selector);
+	const approval = summary.workflowStatus?.status === "awaiting_user" ? summary.workflowStatus.approvalRequest : null;
+	if (!approval) throw new Error(`No pending workflow approval for ${selector}.`);
+	// Session slash commands must be single-line: any newline silently degrades the
+	// text to a plain model prompt instead of the trusted approval path.
+	const reason = reasonParts
+		.join(" ")
+		.replace(/[\r\n\u2028\u2029]+/gu, " ")
+		.trim();
+	const message = action === "approve" ? "/workflow approve" : `/workflow reject${reason ? ` ${reason}` : ""}`;
+	requireSuccess(
+		await client.request({
+			type: "prompt_and_wait",
+			activeSessionId: summary.activeSessionId!,
+			message,
+		}),
+	);
+	const refreshed = selectWorkflowSession(await getWorkflowSessions(client), selector);
+	if (json) {
+		printJson(refreshed);
+		return;
+	}
+	console.log(formatWorkflowStatusText(refreshed));
+}
+
 async function runWorkflowWatch(client: DaemonClient, args: string[], json: boolean): Promise<void> {
 	const options = parseWorkflowWatchArgs(args);
 	const interrupted = waitForWorkflowWatchInterrupt();
@@ -951,29 +994,70 @@ function selectWorkflowSession(sessions: readonly SessionSummary[], selector: st
 	throw new Error(`Unknown active session: ${selector}`);
 }
 
-function formatWorkflowStatusText(summary: SessionSummary): string {
+export function formatWorkflowStatusText(summary: SessionSummary, nowMs = Date.now()): string {
+	const agent = summary.sessionName ?? summary.activeSessionId ?? summary.id;
 	const workflow = summary.workflowStatus;
 	if (!workflow) {
 		return [
-			`Agent: ${summary.sessionName ?? summary.activeSessionId ?? summary.id}`,
+			`Agent: ${agent}`,
 			`Session: ${summary.activeSessionId ?? summary.id}`,
 			"Workflow: unavailable (daemon did not negotiate workflow_status_projection)",
 		].join("\n");
 	}
-	return [
-		`Agent: ${summary.sessionName ?? summary.activeSessionId ?? summary.id}`,
+	const approval = workflow.status === "awaiting_user" ? workflow.approvalRequest : null;
+	const blocker = workflow.blocker
+		? `${workflow.blocker.kind}: ${workflow.blocker.reason}`
+		: approval
+			? `awaiting human approval (${approvalExpiryPhrase(approval.expiresAt, nowMs, true)})`
+			: "none";
+	const lines = [
+		`Agent: ${agent}`,
 		`Session: ${summary.activeSessionId ?? summary.id}`,
 		`Workflow: ${workflow.workflowId ?? "unknown"}`,
 		`Status: ${workflow.status}`,
 		`Phase: ${workflow.phase ?? "unknown"}`,
 		`Next gate: ${workflow.nextGate ?? "none"}`,
 		`Next task: ${workflow.nextTask ?? "none"}`,
-		`Blocker: ${workflow.blocker ? `${workflow.blocker.kind}: ${workflow.blocker.reason}` : "none"}`,
+		`Blocker: ${blocker}`,
 		`Journal head: ${workflow.headDigest ?? "unknown"}`,
 		`Node methodology: ${formatWorkflowSpecializations(workflow)}`,
 		`Attempts: ${workflow.attempts?.length ?? 0}`,
 		`Leases: ${workflow.leases?.length ?? 0}`,
-	].join("\n");
+	];
+	if (approval) {
+		if (workflow.objective) lines.push(`Objective: ${workflow.objective}`);
+		if (workflow.tasks !== undefined && workflow.tasks.length > 0)
+			lines.push(`Tasks: ${workflow.tasks.map((task) => `${task.taskId} (${task.role})`).join(", ")}`);
+		lines.push(
+			`Approval: ${approval.approvalRequestId}`,
+			`Question: ${approval.question}`,
+			`Options: ${approval.options.map((option) => option.optionId).join(", ")}`,
+			`Expires: ${approval.expiresAt} (${approvalExpiryPhrase(approval.expiresAt, nowMs, false)})`,
+			`Approve: prime-agent workflow approve ${agent}`,
+			`Reject:  prime-agent workflow reject ${agent}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+function approvalExpiryPhrase(expiresAt: string, nowMs: number, forBlocker: boolean): string {
+	const expiresAtMs = Date.parse(expiresAt);
+	if (!Number.isFinite(expiresAtMs)) return "expiry unknown";
+	if (expiresAtMs > nowMs) {
+		const countdown = formatApprovalDuration(expiresAtMs - nowMs);
+		return forBlocker ? `expires in ${countdown}` : `in ${countdown}`;
+	}
+	const overdue = formatApprovalDuration(nowMs - expiresAtMs);
+	return forBlocker
+		? `credential expired ${overdue} ago; approving mints a fresh credential`
+		: `expired ${overdue} ago`;
+}
+
+function formatApprovalDuration(milliseconds: number): string {
+	const seconds = Math.floor(milliseconds / 1000);
+	if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h${Math.floor((seconds % 3600) / 60)}m`;
+	if (seconds >= 60) return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
+	return `${seconds}s`;
 }
 
 function formatWorkflowSpecializations(workflow: DaemonWorkflowStatusProjection): string {

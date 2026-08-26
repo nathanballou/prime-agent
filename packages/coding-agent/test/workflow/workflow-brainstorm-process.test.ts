@@ -17,7 +17,7 @@ afterEach(() => {
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function spawnPhase(mode: "draft" | "propose", rootDir: string): ChildProcess {
+function spawnPhase(mode: "draft" | "propose" | "status" | "reject", rootDir: string): ChildProcess {
 	const child = spawn(process.execPath, [tsxPath, fixturePath, mode, rootDir], {
 		env: { ...process.env, TSX_TSCONFIG_PATH: resolve(__dirname, "../../../../tsconfig.json") },
 		stdio: ["ignore", "pipe", "pipe"],
@@ -67,6 +67,16 @@ describe("workflow brainstorming process boundary", () => {
 
 		const propose = spawnPhase("propose", rootDir);
 		await waitForExit(propose);
+		const proposalProjection = {
+			status: "awaiting_user",
+			objective: "Ship an automatic restart-safe workflow preflight",
+			// The sealed goal-source document normalizes task order; assert its order, not the draft's.
+			tasks: [
+				{ taskId: "attack-fresh-process", role: "red-team" },
+				{ taskId: "verify-fresh-process", role: "verification" },
+			],
+			approvalRequest: { approvalRequestId: expect.any(String), expiresAt: expect.any(String) },
+		};
 		expect(readResult(rootDir)).toMatchObject({
 			mode: "propose",
 			activeTools: [],
@@ -74,6 +84,27 @@ describe("workflow brainstorming process boundary", () => {
 			approvalRequestId: expect.any(String),
 			approvalOptions: expect.arrayContaining(["approve", "approve_cloud"]),
 			goalSourceCount: 1,
+			projection: proposalProjection,
 		});
-	}, 120_000);
+
+		// A restarted session must recover the same operator-facing proposal summary
+		// from durable state; the in-memory proposal is gone in this process.
+		const statusAfterRestart = spawnPhase("status", rootDir);
+		await waitForExit(statusAfterRestart);
+		expect(readResult(rootDir)).toMatchObject({
+			mode: "status",
+			projection: proposalProjection,
+		});
+
+		// /workflow reject must terminate the proposal durably and kill the credential,
+		// from a restarted session, without the model ever seeing a proof.
+		const rejectAfterRestart = spawnPhase("reject", rootDir);
+		await waitForExit(rejectAfterRestart);
+		expect(readResult(rootDir)).toMatchObject({
+			mode: "reject",
+			status: expect.stringContaining("cancelled"),
+			workflowStatus: "cancelled",
+			approvalCredentialPresent: false,
+		});
+	}, 240_000);
 });

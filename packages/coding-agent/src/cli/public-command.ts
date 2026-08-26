@@ -266,11 +266,11 @@ async function runWorkflow(args: string[]): Promise<PublicCommandResult> {
 				: `Run "${APP_NAME} help workflow" for usage.`,
 		);
 	}
-	if (subcommand === "status") {
+	if (subcommand === "status" || subcommand === "approve" || subcommand === "reject") {
 		if (args.length < 2) {
-			return fail(`Usage: ${APP_NAME} ${getCommandSpec(["workflow", "status"])!.usage}`);
+			return fail(`Usage: ${APP_NAME} ${getCommandSpec(["workflow", subcommand])!.usage}`);
 		}
-		return runInternalAgentCommand("workflow-status", args.slice(1));
+		return runInternalAgentCommand(`workflow-${subcommand}`, args.slice(1));
 	}
 	return runInternalAgentCommand("workflow-watch", args.slice(1));
 }

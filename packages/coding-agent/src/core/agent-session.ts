@@ -335,10 +335,12 @@ import { resolveAutoresearchTask } from "./workflow/autoresearch-entry.js";
 import {
 	createWorkflowBrainstormState,
 	createWorkflowProposalTool,
+	readWorkflowProposalTaskSummaries,
 	restoreWorkflowBrainstormState,
 	WORKFLOW_PROPOSE_TOOL_NAME,
 	type WorkflowBrainstormProposal,
 	type WorkflowBrainstormState,
+	type WorkflowProposalTaskSummary,
 	workflowBrainstormMessage,
 	workflowBrainstormPrompt,
 	workflowProposalDigest,
@@ -1332,6 +1334,8 @@ function parseWorkflowSessionCommand(args: string): WorkflowSessionCommand {
 		case "approve":
 			if (remainder !== "" && remainder !== "--cloud") throw new Error("Usage: /workflow approve [--cloud]");
 			return { kind: "approve", cloud: remainder === "--cloud" };
+		case "reject":
+			return { kind: "reject", reason: remainder || undefined };
 		case "pause":
 			if (remainder.length === 0) throw new Error("Usage: /workflow pause <reason>");
 			return { kind: "pause", reason: remainder };
@@ -1821,6 +1825,7 @@ export class AgentSession {
 	private _workflowHostRequestHandlers?: HostRequestHandlers;
 	private _workflowExecutionEvidenceSource?: WorkflowExecutionEvidenceSource;
 	private _workflowBrainstorm?: WorkflowBrainstormState;
+	private _workflowProposalTasks?: readonly WorkflowProposalTaskSummary[];
 	private _workflowExecutionTurnHandle?: WorkflowExecutionTurnHandle;
 	private _workflowExecutionToolStarts: WorkflowExecutionToolCallFact[] = [];
 	private _workflowExecutionToolEnds: WorkflowExecutionToolResultFact[] = [];
@@ -2200,6 +2205,17 @@ export class AgentSession {
 	}
 
 	/**
+	 * Record the sealed proposal's task list for operator-facing status projections.
+	 *
+	 * Args:
+	 * tasks: Task identities with roles from the sealed proposal.
+	 * Return: No value.
+	 */
+	setWorkflowProposalTasks(tasks: readonly WorkflowProposalTaskSummary[]): void {
+		this._workflowProposalTasks = tasks.map(({ taskId, role }) => ({ taskId, role }));
+	}
+
+	/**
 	 * Register the one-use loader that creates workflow authority only after a proposal is complete.
 	 * Args:
 	 * loader: Host-owned initializer that must bind the resulting workflow host to this session.
@@ -2230,6 +2246,10 @@ export class AgentSession {
 			phase: status.phase === "recovering" ? null : status.phase,
 			nextGate: null,
 			nextTask: null,
+			objective: status.goal.objective ?? null,
+			...(this._workflowProposalTasks === undefined
+				? {}
+				: { tasks: this._workflowProposalTasks.map(({ taskId, role }) => ({ taskId, role })) }),
 			blocker:
 				blocked === undefined
 					? null
@@ -2383,6 +2403,8 @@ export class AgentSession {
 		const status = await this.executeWorkflowCommand({ kind: "start", request });
 		if (status.status !== "awaiting_user")
 			throw new Error("Workflow proposal did not reach the durable awaiting-user approval state.");
+		const proposalTasks = await readWorkflowProposalTaskSummaries(artifactRoot, proposal.objective.trim());
+		if (proposalTasks !== undefined) this.setWorkflowProposalTasks(proposalTasks);
 		this._persistWorkflowBrainstormState({
 			...state,
 			status: "proposed",
@@ -2422,6 +2444,24 @@ export class AgentSession {
 		const state = this._workflowBrainstorm;
 		if (state?.status === "proposed") {
 			this._persistWorkflowBrainstormState({ ...state, status: "activated" });
+			this.setActiveToolsByName([...state.previousToolNames]);
+		}
+		return status;
+	}
+
+	private async _rejectWorkflowProposal(reason?: string): Promise<WorkflowShellStatus> {
+		const workflowHost = await this._ensureWorkflowHost();
+		const pending = workflowHost.status();
+		if (pending.status !== "awaiting_user" || pending.approvalRequest === null)
+			throw new Error("Workflow rejection requires one pending durable proposal.");
+		const status = await this.executeWorkflowCommand({ kind: "reject", reason });
+		if (status.status !== "cancelled")
+			throw new Error("Workflow rejection did not durably cancel the pending proposal.");
+		const artifactRoot = this.sessionManager.getSessionArtifactDir();
+		if (artifactRoot !== undefined) await removeWorkflowCliApprovalDelivery(artifactRoot);
+		const state = this._workflowBrainstorm;
+		if (state?.status === "proposed") {
+			this._persistWorkflowBrainstormState({ ...state, status: "cancelled" });
 			this.setActiveToolsByName([...state.previousToolNames]);
 		}
 		return status;
@@ -8712,6 +8752,8 @@ export class AgentSession {
 						resultText = await this._beginWorkflowBrainstorm(workflowCommand);
 					} else if (workflowCommand.kind === "approve") {
 						resultText = formatWorkflowSessionStatus(await this._approveWorkflowProposal(workflowCommand.cloud));
+					} else if (workflowCommand.kind === "reject") {
+						resultText = formatWorkflowSessionStatus(await this._rejectWorkflowProposal(workflowCommand.reason));
 					} else if (workflowCommand.kind === "cancel" && this._workflowBrainstorm?.status === "draft") {
 						const state = this._workflowBrainstorm;
 						this._persistWorkflowBrainstormState({ ...state, status: "cancelled" });
