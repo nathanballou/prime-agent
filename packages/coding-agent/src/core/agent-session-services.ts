@@ -21,6 +21,7 @@ import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
+import { readWorkflowProposalTaskSummaries } from "./workflow/brainstorm.js";
 import { persistWorkflowCliApprovalDelivery } from "./workflow/cli-approval.js";
 import { type DurableApprovalSecretProof, digestObject, type WorkflowApprovalRequest } from "./workflow/contracts.js";
 import type { DefaultPrimeTaskRuntimeAuthorityFactory } from "./workflow/default-prime.js";
@@ -777,6 +778,15 @@ export async function createAgentSessionFromServices(
 					if (options.services.workflowHostFactory !== undefined) await workflowHost.recoverBeforeResume();
 					else if (workflowHost.status().status === "active") await workflowHost.recoverBeforeResume();
 					result.session.setWorkflowHost(workflowHost, executionEvidenceSource);
+					// A reopened session lost the in-memory proposal; recover the sealed task
+					// list from the persisted goal source so status stays operator-readable.
+					if (workflowHost.status().status === "awaiting_user") {
+						const proposalTasks = await readWorkflowProposalTaskSummaries(
+							artifactRoot,
+							workflowHost.status().goal.objective,
+						).catch(() => undefined);
+						if (proposalTasks !== undefined) result.session.setWorkflowProposalTasks(proposalTasks);
+					}
 				} catch (error) {
 					executionEvidenceSource = undefined;
 					await workflowHost?.dispose?.().catch(() => undefined);

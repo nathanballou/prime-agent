@@ -11,8 +11,8 @@ import { getMessageText } from "../suite/harness.js";
 
 const mode = process.argv[2];
 const rootDir = process.argv[3];
-if ((mode !== "draft" && mode !== "propose") || rootDir === undefined)
-	throw new Error("Usage: workflow-brainstorm-process.ts <draft|propose> <root>");
+if ((mode !== "draft" && mode !== "propose" && mode !== "status") || rootDir === undefined)
+	throw new Error("Usage: workflow-brainstorm-process.ts <draft|propose|status> <root>");
 
 mkdirSync(rootDir, { recursive: true });
 const metadataPath = join(rootDir, "metadata.json");
@@ -179,10 +179,27 @@ async function propose(): Promise<void> {
 			? readdirSync(sourceDirectory).filter((fileName) => /^sha256=[0-9a-f]{64}\.json$/.test(fileName)).length
 			: 0,
 		workflowArtifacts: sessionManager.getSessionArtifactDir(),
+		projection: session.getWorkflowStatusProjection() ?? null,
 	});
 	await session.disposeAsync();
 	faux.unregister();
 	process.exit(0);
 }
 
-await (mode === "draft" ? draft() : propose());
+async function status(): Promise<void> {
+	const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { sessionFile: string; sessionDir: string };
+	const sessionManager = SessionManager.open(metadata.sessionFile, metadata.sessionDir);
+	const { faux, session } = await createProcessSession(sessionManager);
+	// Binding the workflow host is what fills the projection after a restart;
+	// /workflow status forces that bind without touching the pending approval.
+	await session.promptAndWait("/workflow status");
+	writeResult({
+		mode,
+		projection: session.getWorkflowStatusProjection() ?? null,
+	});
+	await session.disposeAsync();
+	faux.unregister();
+	process.exit(0);
+}
+
+await (mode === "draft" ? draft() : mode === "propose" ? propose() : status());

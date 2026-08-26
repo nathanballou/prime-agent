@@ -951,29 +951,70 @@ function selectWorkflowSession(sessions: readonly SessionSummary[], selector: st
 	throw new Error(`Unknown active session: ${selector}`);
 }
 
-function formatWorkflowStatusText(summary: SessionSummary): string {
+export function formatWorkflowStatusText(summary: SessionSummary, nowMs = Date.now()): string {
+	const agent = summary.sessionName ?? summary.activeSessionId ?? summary.id;
 	const workflow = summary.workflowStatus;
 	if (!workflow) {
 		return [
-			`Agent: ${summary.sessionName ?? summary.activeSessionId ?? summary.id}`,
+			`Agent: ${agent}`,
 			`Session: ${summary.activeSessionId ?? summary.id}`,
 			"Workflow: unavailable (daemon did not negotiate workflow_status_projection)",
 		].join("\n");
 	}
-	return [
-		`Agent: ${summary.sessionName ?? summary.activeSessionId ?? summary.id}`,
+	const approval = workflow.status === "awaiting_user" ? workflow.approvalRequest : null;
+	const blocker = workflow.blocker
+		? `${workflow.blocker.kind}: ${workflow.blocker.reason}`
+		: approval
+			? `awaiting human approval (${approvalExpiryPhrase(approval.expiresAt, nowMs, true)})`
+			: "none";
+	const lines = [
+		`Agent: ${agent}`,
 		`Session: ${summary.activeSessionId ?? summary.id}`,
 		`Workflow: ${workflow.workflowId ?? "unknown"}`,
 		`Status: ${workflow.status}`,
 		`Phase: ${workflow.phase ?? "unknown"}`,
 		`Next gate: ${workflow.nextGate ?? "none"}`,
 		`Next task: ${workflow.nextTask ?? "none"}`,
-		`Blocker: ${workflow.blocker ? `${workflow.blocker.kind}: ${workflow.blocker.reason}` : "none"}`,
+		`Blocker: ${blocker}`,
 		`Journal head: ${workflow.headDigest ?? "unknown"}`,
 		`Node methodology: ${formatWorkflowSpecializations(workflow)}`,
 		`Attempts: ${workflow.attempts?.length ?? 0}`,
 		`Leases: ${workflow.leases?.length ?? 0}`,
-	].join("\n");
+	];
+	if (approval) {
+		if (workflow.objective) lines.push(`Objective: ${workflow.objective}`);
+		if (workflow.tasks !== undefined && workflow.tasks.length > 0)
+			lines.push(`Tasks: ${workflow.tasks.map((task) => `${task.taskId} (${task.role})`).join(", ")}`);
+		lines.push(
+			`Approval: ${approval.approvalRequestId}`,
+			`Question: ${approval.question}`,
+			`Options: ${approval.options.map((option) => option.optionId).join(", ")}`,
+			`Expires: ${approval.expiresAt} (${approvalExpiryPhrase(approval.expiresAt, nowMs, false)})`,
+			`Approve: prime-agent workflow approve ${agent}`,
+			`Reject:  prime-agent workflow reject ${agent}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+function approvalExpiryPhrase(expiresAt: string, nowMs: number, forBlocker: boolean): string {
+	const expiresAtMs = Date.parse(expiresAt);
+	if (!Number.isFinite(expiresAtMs)) return "expiry unknown";
+	if (expiresAtMs > nowMs) {
+		const countdown = formatApprovalDuration(expiresAtMs - nowMs);
+		return forBlocker ? `expires in ${countdown}` : `in ${countdown}`;
+	}
+	const overdue = formatApprovalDuration(nowMs - expiresAtMs);
+	return forBlocker
+		? `credential expired ${overdue} ago; approving mints a fresh credential`
+		: `expired ${overdue} ago`;
+}
+
+function formatApprovalDuration(milliseconds: number): string {
+	const seconds = Math.floor(milliseconds / 1000);
+	if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h${Math.floor((seconds % 3600) / 60)}m`;
+	if (seconds >= 60) return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
+	return `${seconds}s`;
 }
 
 function formatWorkflowSpecializations(workflow: DaemonWorkflowStatusProjection): string {

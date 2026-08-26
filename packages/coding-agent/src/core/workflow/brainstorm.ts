@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
@@ -820,6 +820,70 @@ export async function readWorkflowTaskGraphSource(input: {
 	if (parsed.taskGraphDigest !== taskGraphSource.graphDigest)
 		throw new Error("workflow_task_graph_source_digest_invalid");
 	return taskGraphSource;
+}
+
+/** Task identity and role, projected for operator-facing workflow status. */
+export interface WorkflowProposalTaskSummary {
+	readonly taskId: string;
+	readonly role: string;
+}
+
+/**
+ * Recover the sealed proposal's task list from the persisted goal-source documents.
+ *
+ * Display-only: the approval credential path stays authoritative. The document is
+ * matched by objective because the durable workflow state does not reference the
+ * goal-source file; with several matches the newest document wins.
+ *
+ * Args:
+ * artifactRoot: Private persisted session-artifact root.
+ * objective: Goal objective the pending proposal was sealed with.
+ * Return: Task identities with roles, or undefined when no document matches.
+ */
+export async function readWorkflowProposalTaskSummaries(
+	artifactRoot: string,
+	objective: string | undefined,
+): Promise<readonly WorkflowProposalTaskSummary[] | undefined> {
+	if (objective === undefined) return undefined;
+	const directory = join(artifactRoot, "workflow-goal-sources");
+	let fileNames: string[];
+	try {
+		fileNames = await readdir(directory);
+	} catch {
+		return undefined;
+	}
+	const candidates = await Promise.all(
+		fileNames
+			.filter((fileName) => /^sha256=[0-9a-f]{64}\.json$/.test(fileName))
+			.map(async (fileName) => {
+				const path = join(directory, fileName);
+				try {
+					return { path, modifiedMs: (await stat(path)).mtimeMs };
+				} catch {
+					return undefined;
+				}
+			}),
+	);
+	for (const candidate of candidates
+		.filter((entry) => entry !== undefined)
+		.sort((left, right) => right.modifiedMs - left.modifiedMs)) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await readFile(candidate.path, "utf8"));
+		} catch {
+			continue;
+		}
+		if (!isRecord(parsed) || parsed.objective !== objective || !isRecord(parsed.taskGraphSource)) continue;
+		const tasks = parsed.taskGraphSource.tasks;
+		if (!Array.isArray(tasks)) continue;
+		const summaries: WorkflowProposalTaskSummary[] = [];
+		for (const task of tasks) {
+			if (!isRecord(task) || typeof task.taskId !== "string") continue;
+			summaries.push({ taskId: task.taskId, role: typeof task.role === "string" ? task.role : "implementation" });
+		}
+		if (summaries.length > 0) return summaries;
+	}
+	return undefined;
 }
 
 export async function workflowStartRequestFromProposal(input: {
