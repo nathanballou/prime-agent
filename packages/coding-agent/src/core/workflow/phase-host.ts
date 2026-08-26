@@ -4,6 +4,7 @@ import {
 	isWorkflowApprovalManager,
 	type WorkflowApprovalHostOutcome,
 	type WorkflowApprovalManager,
+	WorkflowApprovalResponseBindingError,
 } from "./approvals.js";
 import type { WorkflowCompletionGate } from "./completion-gate.js";
 import { isWorkflowCompletionGateForStore } from "./completion-gate.js";
@@ -944,10 +945,21 @@ async function respondWorkflow(
 				: (() => {
 						throw new Error("Workflow approval response requires a structured trusted proof.");
 					})();
-	const consumed =
-		response.mode === "interactive_secret"
-			? await approvals.consumeInteractive(response)
-			: await approvals.consumeSignedHeadless(response);
+	let consumed: Awaited<ReturnType<WorkflowApprovalManager["consumeInteractive"]>>;
+	try {
+		consumed =
+			response.mode === "interactive_secret"
+				? await approvals.consumeInteractive(response)
+				: await approvals.consumeSignedHeadless(response);
+	} catch (error) {
+		// Only expiry re-mints: every other binding failure (digest drift, foreign
+		// principal, stale sequence) still hard-fails without touching the request.
+		if (!(error instanceof WorkflowApprovalResponseBindingError) || error.binding !== "expired") throw error;
+		const reminted = await remintExpiredApprovalRequest(context, approvals, request);
+		throw new Error(
+			`Workflow approval credential expired at ${request.expiresAt}. A fresh credential was minted for approval request ${reminted.approvalRequestId} (expires ${reminted.expiresAt}); retry the approval command.`,
+		);
+	}
 	if (consumed.status !== "consumed") throw new Error("Workflow approval response was already consumed.");
 	const selectedOutcome = consumedApprovalOutcome(consumed);
 	if (selectedOutcome.optionId !== command.optionId)
@@ -990,6 +1002,64 @@ async function respondWorkflow(
 			return shellStatus(context);
 	}
 	throw new Error("Unsupported workflow approval outcome.");
+}
+
+/**
+ * Replace an expired pending approval with a freshly credentialed request.
+ *
+ * The expired request's decision refs, digests, question, and options are reused
+ * verbatim; only the response sequence advances and the expiry restarts, so what
+ * the operator approves is byte-identical to the sealed proposal. awaiting_user
+ * cannot re-enter awaiting_user directly, so the workflow hops through paused —
+ * both legs are legal transitions and the journal keeps the expiry visible.
+ *
+ * Args:
+ * context: Phase host context owning the durable store and goal projection.
+ * approvals: Host approval manager that mints and delivers the credential.
+ * expired: The pending request whose credential passed its expiry.
+ * Return: The re-minted approval request now pending for the workflow.
+ */
+async function remintExpiredApprovalRequest(
+	context: WorkflowPhaseHostContext,
+	approvals: WorkflowApprovalManager,
+	expired: WorkflowApprovalRequest,
+): Promise<WorkflowApprovalRequest> {
+	const paused = await appendGoalTransition(
+		context,
+		"paused",
+		"adjudicating",
+		`Approval request ${expired.approvalRequestId} expired at ${expired.expiresAt}; minting a fresh credential.`,
+	);
+	const epoch = { storeEpoch: expired.storeEpoch, coordinatorEpoch: expired.coordinatorEpoch };
+	const awaitingGoal = createStatusGoal(
+		context.goalProjection.read(),
+		"awaiting_user",
+		"Awaiting exact approval with a re-minted credential after the previous one expired.",
+	);
+	return approvals.createRequest({
+		workflowId: expired.workflowId,
+		decisionRef: expired.decisionRef,
+		decisionRefs: workflowApprovalDecisionRefs(expired),
+		decisionRoles: expired.decisionRoles,
+		headDigest: paused.sourceJournalDigest,
+		stateDigest: paused.sourceJournalDigest,
+		configDigest: expired.configDigest,
+		profileDigest: expired.profileDigest,
+		artifactDigest: expired.artifactDigest,
+		storeEpoch: epoch.storeEpoch,
+		coordinatorEpoch: epoch.coordinatorEpoch,
+		expectedResponseSequence: expired.expectedResponseSequence + 1,
+		ttlMilliseconds: 300_000,
+		question: expired.question,
+		options: expired.options.map((option) => ({ ...option })),
+		awaitingUserTransition: {
+			status: "awaiting_user",
+			phase: "adjudicating",
+			goalDelta: toGoalMutationDelta(awaitingGoal),
+			expectedHeadDigest: paused.sourceJournalDigest,
+			expectedEpoch: epoch,
+		},
+	});
 }
 
 async function cancelWorkflow(context: WorkflowPhaseHostContext, reason: string): Promise<WorkflowShellStatus> {
