@@ -11,8 +11,8 @@ import { getMessageText } from "../suite/harness.js";
 
 const mode = process.argv[2];
 const rootDir = process.argv[3];
-if ((mode !== "draft" && mode !== "propose" && mode !== "status") || rootDir === undefined)
-	throw new Error("Usage: workflow-brainstorm-process.ts <draft|propose|status> <root>");
+if ((mode !== "draft" && mode !== "propose" && mode !== "status" && mode !== "reject") || rootDir === undefined)
+	throw new Error("Usage: workflow-brainstorm-process.ts <draft|propose|status|reject> <root>");
 
 mkdirSync(rootDir, { recursive: true });
 const metadataPath = join(rootDir, "metadata.json");
@@ -186,6 +186,23 @@ async function propose(): Promise<void> {
 	process.exit(0);
 }
 
+async function reject(): Promise<void> {
+	const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { sessionFile: string; sessionDir: string };
+	const sessionManager = SessionManager.open(metadata.sessionFile, metadata.sessionDir);
+	const { faux, session } = await createProcessSession(sessionManager);
+	await session.promptAndWait("/workflow reject scope is wrong; brainstorm again with narrower boundaries");
+	const delivery = await readWorkflowCliApprovalDelivery(sessionManager.getSessionArtifactDir()!);
+	writeResult({
+		mode,
+		status: getMessageText(session.messages.at(-1)),
+		workflowStatus: session.getWorkflowStatusProjection()?.status ?? null,
+		approvalCredentialPresent: delivery !== undefined,
+	});
+	await session.disposeAsync();
+	faux.unregister();
+	process.exit(0);
+}
+
 async function status(): Promise<void> {
 	const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { sessionFile: string; sessionDir: string };
 	const sessionManager = SessionManager.open(metadata.sessionFile, metadata.sessionDir);
@@ -202,4 +219,4 @@ async function status(): Promise<void> {
 	process.exit(0);
 }
 
-await (mode === "draft" ? draft() : mode === "propose" ? propose() : status());
+await (mode === "draft" ? draft() : mode === "propose" ? propose() : mode === "reject" ? reject() : status());

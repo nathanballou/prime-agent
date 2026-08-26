@@ -41,6 +41,8 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"list",
 	"workflow-status",
 	"workflow-watch",
+	"workflow-approve",
+	"workflow-reject",
 	"create",
 	"attach",
 	"detach",
@@ -192,6 +194,12 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				return;
 			case "workflow-watch":
 				await runWorkflowWatch(client, parsed.positionals, parsed.json);
+				return;
+			case "workflow-approve":
+				await runWorkflowRespond(client, parsed.positionals, parsed.json, "approve");
+				return;
+			case "workflow-reject":
+				await runWorkflowRespond(client, parsed.positionals, parsed.json, "reject");
 				return;
 			case "create":
 				await runCreate(client, parsed.positionals, parsed.json);
@@ -825,6 +833,41 @@ async function runWorkflowStatus(client: DaemonClient, args: string[], json: boo
 		return;
 	}
 	console.log(formatWorkflowStatusText(summary));
+}
+
+async function runWorkflowRespond(
+	client: DaemonClient,
+	args: string[],
+	json: boolean,
+	action: "approve" | "reject",
+): Promise<void> {
+	const [selector, ...reasonParts] = args;
+	if (!selector || selector.startsWith("-") || (action === "approve" && reasonParts.length > 0)) {
+		throw new Error(`Usage: prime-agent workflow ${action} <agent>${action === "reject" ? " [reason]" : ""}`);
+	}
+	const summary = selectWorkflowSession(await getWorkflowSessions(client), selector);
+	const approval = summary.workflowStatus?.status === "awaiting_user" ? summary.workflowStatus.approvalRequest : null;
+	if (!approval) throw new Error(`No pending workflow approval for ${selector}.`);
+	// Session slash commands must be single-line: any newline silently degrades the
+	// text to a plain model prompt instead of the trusted approval path.
+	const reason = reasonParts
+		.join(" ")
+		.replace(/[\r\n\u2028\u2029]+/gu, " ")
+		.trim();
+	const message = action === "approve" ? "/workflow approve" : `/workflow reject${reason ? ` ${reason}` : ""}`;
+	requireSuccess(
+		await client.request({
+			type: "prompt_and_wait",
+			activeSessionId: summary.activeSessionId!,
+			message,
+		}),
+	);
+	const refreshed = selectWorkflowSession(await getWorkflowSessions(client), selector);
+	if (json) {
+		printJson(refreshed);
+		return;
+	}
+	console.log(formatWorkflowStatusText(refreshed));
 }
 
 async function runWorkflowWatch(client: DaemonClient, args: string[], json: boolean): Promise<void> {

@@ -17,7 +17,7 @@ afterEach(() => {
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-function spawnPhase(mode: "draft" | "propose" | "status", rootDir: string): ChildProcess {
+function spawnPhase(mode: "draft" | "propose" | "status" | "reject", rootDir: string): ChildProcess {
 	const child = spawn(process.execPath, [tsxPath, fixturePath, mode, rootDir], {
 		env: { ...process.env, TSX_TSCONFIG_PATH: resolve(__dirname, "../../../../tsconfig.json") },
 		stdio: ["ignore", "pipe", "pipe"],
@@ -95,5 +95,16 @@ describe("workflow brainstorming process boundary", () => {
 			mode: "status",
 			projection: proposalProjection,
 		});
-	}, 180_000);
+
+		// /workflow reject must terminate the proposal durably and kill the credential,
+		// from a restarted session, without the model ever seeing a proof.
+		const rejectAfterRestart = spawnPhase("reject", rootDir);
+		await waitForExit(rejectAfterRestart);
+		expect(readResult(rootDir)).toMatchObject({
+			mode: "reject",
+			status: expect.stringContaining("cancelled"),
+			workflowStatus: "cancelled",
+			approvalCredentialPresent: false,
+		});
+	}, 240_000);
 });

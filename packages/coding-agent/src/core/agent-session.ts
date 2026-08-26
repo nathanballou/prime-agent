@@ -1334,6 +1334,8 @@ function parseWorkflowSessionCommand(args: string): WorkflowSessionCommand {
 		case "approve":
 			if (remainder !== "" && remainder !== "--cloud") throw new Error("Usage: /workflow approve [--cloud]");
 			return { kind: "approve", cloud: remainder === "--cloud" };
+		case "reject":
+			return { kind: "reject", reason: remainder || undefined };
 		case "pause":
 			if (remainder.length === 0) throw new Error("Usage: /workflow pause <reason>");
 			return { kind: "pause", reason: remainder };
@@ -2442,6 +2444,24 @@ export class AgentSession {
 		const state = this._workflowBrainstorm;
 		if (state?.status === "proposed") {
 			this._persistWorkflowBrainstormState({ ...state, status: "activated" });
+			this.setActiveToolsByName([...state.previousToolNames]);
+		}
+		return status;
+	}
+
+	private async _rejectWorkflowProposal(reason?: string): Promise<WorkflowShellStatus> {
+		const workflowHost = await this._ensureWorkflowHost();
+		const pending = workflowHost.status();
+		if (pending.status !== "awaiting_user" || pending.approvalRequest === null)
+			throw new Error("Workflow rejection requires one pending durable proposal.");
+		const status = await this.executeWorkflowCommand({ kind: "reject", reason });
+		if (status.status !== "cancelled")
+			throw new Error("Workflow rejection did not durably cancel the pending proposal.");
+		const artifactRoot = this.sessionManager.getSessionArtifactDir();
+		if (artifactRoot !== undefined) await removeWorkflowCliApprovalDelivery(artifactRoot);
+		const state = this._workflowBrainstorm;
+		if (state?.status === "proposed") {
+			this._persistWorkflowBrainstormState({ ...state, status: "cancelled" });
 			this.setActiveToolsByName([...state.previousToolNames]);
 		}
 		return status;
@@ -8732,6 +8752,8 @@ export class AgentSession {
 						resultText = await this._beginWorkflowBrainstorm(workflowCommand);
 					} else if (workflowCommand.kind === "approve") {
 						resultText = formatWorkflowSessionStatus(await this._approveWorkflowProposal(workflowCommand.cloud));
+					} else if (workflowCommand.kind === "reject") {
+						resultText = formatWorkflowSessionStatus(await this._rejectWorkflowProposal(workflowCommand.reason));
 					} else if (workflowCommand.kind === "cancel" && this._workflowBrainstorm?.status === "draft") {
 						const state = this._workflowBrainstorm;
 						this._persistWorkflowBrainstormState({ ...state, status: "cancelled" });

@@ -4,6 +4,7 @@ import {
 	isWorkflowApprovalManager,
 	type WorkflowApprovalHostOutcome,
 	type WorkflowApprovalManager,
+	type WorkflowApprovalManagerWithOutcome,
 	WorkflowApprovalResponseBindingError,
 } from "./approvals.js";
 import type { WorkflowCompletionGate } from "./completion-gate.js";
@@ -1062,6 +1063,34 @@ async function remintExpiredApprovalRequest(
 	});
 }
 
+/**
+ * Reject the pending sealed proposal: invalidate its credential and cancel the workflow.
+ *
+ * A pre-approval workflow has dispatched nothing, so no descendant reconciliation
+ * barrier applies; the awaiting_user -> cancelled transition is direct. The durable
+ * invalidation kills the one-use credential even if the status transition retries.
+ *
+ * Args:
+ * context: Phase host context owning the durable store and approval manager.
+ * reason: Operator-supplied reason recorded on the invalidation and transition.
+ * Return: Shell status after the workflow is durably cancelled.
+ */
+async function rejectWorkflowProposal(
+	context: WorkflowPhaseHostContext,
+	reason = "Workflow proposal rejected by operator.",
+): Promise<WorkflowShellStatus> {
+	requireGoalCoordinator(context);
+	const approvals = context.services.approvals as WorkflowApprovalManagerWithOutcome | undefined;
+	if (approvals?.invalidate === undefined)
+		throw new Error("Workflow rejection requires an invalidating host approval manager.");
+	const state = await context.services.store.reload();
+	if (state === null || state.status !== "awaiting_user" || state.approvalRequest === null)
+		throw new Error("Workflow rejection requires one pending durable proposal.");
+	await approvals.invalidate(state.approvalRequest.approvalRequestId, reason);
+	await appendGoalTransition(context, "cancelled", "recovering", reason);
+	return shellStatus(context);
+}
+
 async function cancelWorkflow(context: WorkflowPhaseHostContext, reason: string): Promise<WorkflowShellStatus> {
 	requireGoalCoordinator(context);
 	const state = await context.services.store.reload();
@@ -1339,6 +1368,8 @@ async function executeCommand(
 		}
 		case "cancel":
 			return cancelWorkflow(context, command.reason ?? "cancelled by operator");
+		case "reject":
+			return rejectWorkflowProposal(context, command.reason);
 		default: {
 			const exhaustive: never = command;
 			throw new Error(`Unsupported workflow command ${exhaustive}.`);

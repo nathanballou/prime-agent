@@ -175,7 +175,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		name: "workflow",
 		description: "Brainstorm, approve, and control a durable workflow",
 		argumentHint:
-			"[<prompt>|start [--profile inline|parallel] [--max-workers <n>] <prompt>|approve [--cloud]|status|decisions|resources|respond|pause|resume|cancel]",
+			"[<prompt>|start [--profile inline|parallel] [--max-workers <n>] <prompt>|approve [--cloud]|reject [reason]|status|decisions|resources|respond|pause|resume|cancel]",
 		takesArgument: true,
 	},
 	{

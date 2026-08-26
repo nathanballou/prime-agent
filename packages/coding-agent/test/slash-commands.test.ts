@@ -268,7 +268,7 @@ describe("session slash commands", () => {
 		expect(SESSION_SLASH_COMMAND_NAMES).toContain("workflow");
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "workflow")).toMatchObject({
 			argumentHint:
-				"[<prompt>|start [--profile inline|parallel] [--max-workers <n>] <prompt>|approve [--cloud]|status|decisions|resources|respond|pause|resume|cancel]",
+				"[<prompt>|start [--profile inline|parallel] [--max-workers <n>] <prompt>|approve [--cloud]|reject [reason]|status|decisions|resources|respond|pause|resume|cancel]",
 			takesArgument: true,
 		});
 		expect(parseSessionSlashCommand("/workflow")).toEqual({

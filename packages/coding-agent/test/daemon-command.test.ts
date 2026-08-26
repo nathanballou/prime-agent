@@ -295,6 +295,57 @@ describe("daemon command", () => {
 		expect(daemonClientMock.instances[0]?.requests[0]).toEqual({ type: "list", all: false });
 	});
 
+	it("delivers a single-line /workflow approve to the selected agent", async () => {
+		daemonClientMock.behavior.schemaRevision = DAEMON_SCHEMA_REVISION;
+		daemonClientMock.behavior.serverCapabilities = ["workflow_status_projection"];
+		daemonClientMock.behavior.sessions = [makeAwaitingApprovalSummary("active-1", "session-1", "worker")];
+
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "workflow-approve", "worker"]),
+		).resolves.toBe(true);
+
+		const prompt = daemonClientMock.instances[0]?.requests.find((request) => request.type === "prompt_and_wait");
+		expect(prompt).toMatchObject({ type: "prompt_and_wait", activeSessionId: "active-1" });
+		expect(prompt?.message).toBe("/workflow approve");
+	});
+
+	it("folds a multi-line reject reason into one line so the session command survives parsing", async () => {
+		daemonClientMock.behavior.schemaRevision = DAEMON_SCHEMA_REVISION;
+		daemonClientMock.behavior.serverCapabilities = ["workflow_status_projection"];
+		daemonClientMock.behavior.sessions = [makeAwaitingApprovalSummary("active-1", "session-1", "worker")];
+
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"workflow-reject",
+				"worker",
+				"scope is wrong\nrevise the budgets",
+			]),
+		).resolves.toBe(true);
+
+		const prompt = daemonClientMock.instances[0]?.requests.find((request) => request.type === "prompt_and_wait");
+		expect(prompt?.message).toBe("/workflow reject scope is wrong revise the budgets");
+	});
+
+	it("refuses workflow approve when the agent has no pending approval", async () => {
+		daemonClientMock.behavior.schemaRevision = DAEMON_SCHEMA_REVISION;
+		daemonClientMock.behavior.serverCapabilities = ["workflow_status_projection"];
+		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", "worker")];
+
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "workflow-approve", "worker"]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests.some((request) => request.type === "prompt_and_wait")).toBe(false);
+		expect(
+			consoleErrorMessages.some(
+				(message) => typeof message === "string" && /no pending workflow approval/i.test(message),
+			),
+		).toBe(true);
+	});
+
 	it("keeps workflow watch bounded with --once", async () => {
 		daemonClientMock.behavior.schemaRevision = DAEMON_SCHEMA_REVISION;
 		daemonClientMock.behavior.serverCapabilities = ["workflow_status_projection"];
@@ -625,6 +676,34 @@ function makeSessionSummary(activeSessionId: string, sessionId: string, sessionN
 		attachedClients: 0,
 		messageCount: 0,
 		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+	};
+}
+
+function makeAwaitingApprovalSummary(
+	activeSessionId: string,
+	sessionId: string,
+	sessionName: string,
+): Record<string, unknown> {
+	return {
+		...makeSessionSummary(activeSessionId, sessionId, sessionName),
+		workflowStatus: {
+			workflowId: "workflow-1",
+			status: "awaiting_user",
+			phase: "adjudicating",
+			nextGate: null,
+			nextTask: null,
+			blocker: null,
+			headDigest: "head-1",
+			approvalRequest: {
+				approvalRequestId: "approval-1",
+				question: "Approve?",
+				expiresAt: "2030-01-01T00:05:00.000Z",
+				expectedResponseSequence: 1,
+				headDigest: "head-1",
+				stateDigest: "state-1",
+				options: [{ optionId: "approve", label: "Approve", effectDigest: "effect-1" }],
+			},
+		},
 	};
 }
 

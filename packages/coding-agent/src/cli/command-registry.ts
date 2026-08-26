@@ -81,13 +81,23 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["workflow"],
-		usage: "workflow <status|watch>",
-		summary: "Inspect a workflow hosted by an agent",
+		usage: "workflow <status|watch|approve|reject>",
+		summary: "Inspect or act on a workflow hosted by an agent",
 	},
 	{
 		path: ["workflow", "status"],
 		usage: "workflow status <agent> [--json]",
 		summary: "Show workflow status for an agent",
+	},
+	{
+		path: ["workflow", "approve"],
+		usage: "workflow approve <agent> [--json]",
+		summary: "Approve the agent's pending workflow proposal",
+	},
+	{
+		path: ["workflow", "reject"],
+		usage: "workflow reject <agent> [reason] [--json]",
+		summary: "Reject the agent's pending workflow proposal",
 	},
 	{
 		path: ["workflow", "watch"],
