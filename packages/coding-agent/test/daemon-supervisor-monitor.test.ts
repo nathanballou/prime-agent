@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getProcessStartId } from "../src/core/session-lease.js";
+import { SessionManager } from "../src/core/session-manager.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
@@ -3908,5 +3909,125 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
 		expect(requestWorker).not.toHaveBeenCalled();
+	});
+});
+
+describe("daemon supervisor restart resume", () => {
+	type ResumeWorker = {
+		adoptedLifecycle?: string;
+		descriptor: Record<string, unknown>;
+	};
+	type ResumeSupervisor = {
+		residentRestartResume(worker: ResumeWorker): Promise<{
+			command?: { type: "create"; sessionPath?: string; config?: Record<string, unknown> };
+			skipReason?: string;
+		}>;
+	};
+
+	function makeResumeSupervisor(resumeEnabled = true): ResumeSupervisor {
+		return Object.assign(Object.create(DaemonSupervisor.prototype), {
+			settingsManager: { getResumeSessionsOnRestart: () => resumeEnabled },
+			log: vi.fn(),
+		}) as ResumeSupervisor;
+	}
+
+	function makeAdoptedWorker(sessionFile: string | undefined, adoptedLifecycle?: string): ResumeWorker {
+		return {
+			...(adoptedLifecycle !== undefined ? { adoptedLifecycle } : {}),
+			descriptor: {
+				workerId: "restart-resume",
+				pid: 4242,
+				...(sessionFile !== undefined ? { sessionFile } : {}),
+				createCommand: { type: "create" as const },
+			},
+		};
+	}
+
+	function writeResidentSessionFixture(status: "active" | "archived"): { sessionFile: string; root: string } {
+		const root = mkdtempSync(join(tmpdir(), "prime-restart-resume-"));
+		const manager = SessionManager.create(root, join(root, "sessions"));
+		manager.appendMessage({ role: "user", content: "resume me", timestamp: 1 });
+		manager.appendSessionState({ status });
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("Fixture session did not persist");
+		}
+		return { sessionFile, root };
+	}
+
+	const fixtureRoots: string[] = [];
+	afterEach(() => {
+		for (const root of fixtureRoots.splice(0)) {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("builds the durable resume command for a resident root adopted from a previous daemon", async () => {
+		const fixture = writeResidentSessionFixture("active");
+		fixtureRoots.push(fixture.root);
+		const worker = makeAdoptedWorker(fixture.sessionFile, "recovering");
+		worker.descriptor.sessionDir = "/tmp/session-dir";
+		worker.descriptor.telemetryDisabled = true;
+
+		const result = await makeResumeSupervisor().residentRestartResume(worker);
+
+		expect(result.skipReason).toBeUndefined();
+		expect(result.command).toEqual({
+			type: "create",
+			sessionPath: fixture.sessionFile,
+			config: { sessionDir: "/tmp/session-dir", telemetryDisabled: true },
+		});
+	});
+
+	it("never resumes outside startup adoption", async () => {
+		const fixture = writeResidentSessionFixture("active");
+		fixtureRoots.push(fixture.root);
+
+		const result = await makeResumeSupervisor().residentRestartResume(makeAdoptedWorker(fixture.sessionFile));
+
+		expect(result).toEqual({});
+	});
+
+	it("does not resume a root the previous daemon marked failed", async () => {
+		const fixture = writeResidentSessionFixture("active");
+		fixtureRoots.push(fixture.root);
+
+		const result = await makeResumeSupervisor().residentRestartResume(
+			makeAdoptedWorker(fixture.sessionFile, "failed"),
+		);
+
+		expect(result.command).toBeUndefined();
+		expect(result.skipReason).toMatch(/marked it failed/);
+	});
+
+	it("does not resume when restart resume is disabled in settings", async () => {
+		const fixture = writeResidentSessionFixture("active");
+		fixtureRoots.push(fixture.root);
+
+		const result = await makeResumeSupervisor(false).residentRestartResume(
+			makeAdoptedWorker(fixture.sessionFile, "recovering"),
+		);
+
+		expect(result.command).toBeUndefined();
+		expect(result.skipReason).toMatch(/disabled in settings/);
+	});
+
+	it("does not resume a session no longer marked daemon-resident", async () => {
+		const fixture = writeResidentSessionFixture("archived");
+		fixtureRoots.push(fixture.root);
+
+		const result = await makeResumeSupervisor().residentRestartResume(
+			makeAdoptedWorker(fixture.sessionFile, "recovering"),
+		);
+
+		expect(result.command).toBeUndefined();
+		expect(result.skipReason).toMatch(/no longer marked daemon-resident/);
+	});
+
+	it("does not resume a root without a persisted session file", async () => {
+		const result = await makeResumeSupervisor().residentRestartResume(makeAdoptedWorker(undefined, "recovering"));
+
+		expect(result.command).toBeUndefined();
+		expect(result.skipReason).toMatch(/no persisted session file/);
 	});
 });
